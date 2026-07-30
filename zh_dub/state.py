@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .logutil import log
+from .logutil import format_status_line, log
 
 STAGES = [
     "download",
@@ -86,7 +86,6 @@ class JobState:
         st["status"] = "running"
         st["started_at"] = _now()
         self.save()
-        log(f"state -> running @ {stage}")
 
     def set_done(self, stage: str, **detail: Any) -> None:
         st = self.data["stages"].setdefault(stage, {"status": "pending", "detail": {}})
@@ -105,7 +104,6 @@ class JobState:
         else:
             self.data["status"] = "running"
         self.save()
-        log(f"state -> done @ {stage}")
 
     def set_failed(self, stage: str, message: str, **extra: Any) -> None:
         st = self.data["stages"].setdefault(stage, {"status": "pending", "detail": {}})
@@ -166,11 +164,12 @@ class JobState:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def summary_lines(self) -> list[str]:
+        status = str(self.data.get("status") or "?")
         lines = [
-            f"work:   {self.work}",
-            f"status: {self.data.get('status')}",
-            f"stage:  {self.data.get('stage')}",
-            f"updated:{self.data.get('updated_at')}",
+            f"work     {self.work}",
+            f"status   {status}",
+            f"stage    {self.data.get('stage')}",
+            f"updated  {self.data.get('updated_at')}",
             "stages:",
         ]
         for name in STAGES:
@@ -178,18 +177,31 @@ class JobState:
             detail = st.get("detail") or {}
             extra = ""
             if detail:
-                # short detail
                 bits = []
-                for k in ("segments", "total", "done_batches", "audio_ok", "missing", "out"):
+                for k in (
+                    "segments",
+                    "total",
+                    "done_batches",
+                    "audio_ok",
+                    "missing",
+                    "out",
+                    "progress",
+                    "cues",
+                    "overflow",
+                    "duration",
+                    "size_mb",
+                ):
                     if k in detail:
                         bits.append(f"{k}={detail[k]}")
                 if bits:
-                    extra = " (" + ", ".join(bits) + ")"
-            lines.append(f"  - {name:14s} {st.get('status', '?'):8s}{extra}")
+                    extra = "  " + ", ".join(bits)
+            lines.append(
+                format_status_line(name, str(st.get("status", "?")), extra)
+            )
         err = self.data.get("error")
         if err:
-            lines.append(f"error:  {err.get('message')}")
+            lines.append(f"error    {err.get('message')}")
             if err.get("retryable"):
-                lines.append("retryable: yes")
-        lines.append(f"resume: {self.data.get('resume_hint')}")
+                lines.append("retryable yes")
+        lines.append(f"resume   {self.data.get('resume_hint')}")
         return lines

@@ -39,7 +39,15 @@ def _bootstrap_reexec() -> None:
 _bootstrap_reexec()
 
 from zh_dub.config import Settings  # noqa: E402
-from zh_dub.logutil import log, stage, stage_done  # noqa: E402
+from zh_dub.logutil import (  # noqa: E402
+    detail,
+    highlight,
+    info,
+    keyval,
+    stage,
+    stage_done,
+    warn,
+)
 from zh_dub.pipeline import Pipeline, resolve_work_dir  # noqa: E402
 
 
@@ -132,12 +140,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise SystemExit("quality must be 720, 1080, or best")
     for f in settings.env_files:
-        log(f"loaded {f}")
-    log(f"python={settings.python}")
-    log(f"model={settings.model}")
-    log(f"voice={args.voice or settings.voice} quality={settings.quality}")
-    log(
-        f"tools yt-dlp={settings.yt_dlp} ffmpeg={settings.ffmpeg} "
+        detail(f"loaded {f}")
+    keyval("python", settings.python)
+    keyval("model", settings.model)
+    keyval("voice", args.voice or settings.voice)
+    keyval("quality", settings.quality)
+    keyval("mode", args.mode)
+    detail(
+        f"tools yt-dlp={settings.yt_dlp}  ffmpeg={settings.ffmpeg}  "
         f"edge-tts={settings.edge_tts}"
     )
     stage_done("config")
@@ -159,26 +169,25 @@ def main(argv: list[str] | None = None) -> int:
             clean_yes=bool(args.yes),
         )
     except KeyboardInterrupt:
-        log("interrupted by user")
-        log(f"STATE:  {pipe.state.path}")
-        log(f"RESUME: python job_run.py --work {work} --resume")
+        warn("用户中断")
+        info(f"STATE   {pipe.state.path}")
+        info(f"RESUME  python job_run.py --work {work} --resume")
         return 130
     except Exception as e:  # noqa: BLE001
-        log(f"FAILED: {e}")
+        warn(f"FAILED: {e}")
         return 1
 
     elapsed = time.time() - t0
     stage("job-done", f"elapsed={elapsed:.1f}s")
-    log(f"work:   {work}")
+    highlight(f"任务结束  耗时 {elapsed:.1f}s")
+    keyval("work", work)
     if out:
-        log(f"output: {out}")
-    log(f"state:  {pipe.state.path}")
-    log("改中文后重做配音成片:")
-    log(f"  python job_run.py --work {work} --mode tts-mux")
-    log("查看进度:")
-    log(f"  python job_run.py --work {work} --status")
-    log("失败后续跑:")
-    log(f"  python job_run.py --work {work} --resume")
+        keyval("output", out)
+    keyval("state", pipe.state.path)
+    info("常用命令:")
+    detail(f"改中文后重做配音:  python job_run.py --work {work} --mode tts-mux")
+    detail(f"查看进度:          python job_run.py --work {work} --status")
+    detail(f"失败后续跑:        python job_run.py --work {work} --resume")
     stage_done("job-done")
     return 0
 

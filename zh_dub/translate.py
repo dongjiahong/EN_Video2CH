@@ -7,7 +7,17 @@ from typing import Any
 
 from .captions import drop_fillers, parse_numbered_zh
 from .config import Settings
-from .logutil import log, stage, stage_done, stage_error
+from .logutil import (
+    detail,
+    highlight,
+    info,
+    progress,
+    resume_hint,
+    stage,
+    stage_done,
+    stage_error,
+    warn,
+)
 from .media import clear_proxy_env
 from .state import JobState
 
@@ -67,7 +77,7 @@ def translate_chunk(
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            log(f"  api attempt {attempt}/{retries} (n={n}, thinking on)...")
+            detail(f"API 尝试 {attempt}/{retries}  (n={n}, thinking on)")
             create_kwargs = {
                 "model": model,
                 "messages": [
@@ -101,11 +111,11 @@ def translate_chunk(
             out = (msg.content or "").strip()
             reasoning = getattr(msg, "reasoning_content", None) or ""
             if reasoning:
-                log(f"  thinking_chars={len(reasoning)}")
+                detail(f"thinking_chars={len(reasoning)}")
             usage = getattr(resp, "usage", None)
             if usage:
-                log(
-                    f"  usage prompt={usage.prompt_tokens} "
+                detail(
+                    f"tokens prompt={usage.prompt_tokens} "
                     f"completion={usage.completion_tokens}"
                 )
             if not out and reasoning:
@@ -131,7 +141,7 @@ def translate_chunk(
             missing = [no for no, _ in items if no not in fixed]
             miss_ratio = len(missing) / max(1, n)
             if missing and miss_ratio > 0.05 and attempt < retries:
-                log(f"  missing {len(missing)} ids, retry... e.g. {missing[:8]}")
+                warn(f"缺 {len(missing)} 条，重试... 样例 {missing[:8]}")
                 last_err = TranslateError(
                     f"missing {len(missing)} ids",
                     retryable=True,
@@ -140,11 +150,11 @@ def translate_chunk(
                 time.sleep(1.2 * attempt)
                 continue
             if missing:
-                log(f"  accept with {len(missing)} missing after retries")
+                warn(f"重试后仍缺 {len(missing)} 条，接受当前结果")
             return fixed
         except TranslateError as e:
             last_err = e
-            log(f"  translate attempt {attempt} failed: {e}")
+            warn(f"翻译尝试 {attempt} 失败: {e}")
             if not e.retryable:
                 raise
             time.sleep(1.5 * attempt)
@@ -155,7 +165,7 @@ def translate_chunk(
             low = msg.lower()
             if any(x in low for x in ("401", "403", "invalid api", "authentication")):
                 retryable = False
-            log(f"  translate attempt {attempt} failed: {e}")
+            warn(f"翻译尝试 {attempt} 失败: {e}")
             if not retryable:
                 raise TranslateError(msg, retryable=False) from e
             time.sleep(1.5 * attempt)
@@ -181,6 +191,10 @@ def translate_segments(
         "translate",
         f"total={total} batches={n_batches} size={batch_size} model={settings.model}",
     )
+    info(
+        f"翻译启动  lines={total}  batches={n_batches}  "
+        f"batch_size={batch_size}  model={settings.model}"
+    )
     out: list[str | None] = [None] * total
     done_batches: list[int] = []
 
@@ -192,24 +206,27 @@ def translate_segments(
             continue
         mapping = data.get("mapping") or {}
         start = bi * batch_size
-        ok = 0
+        ok_n = 0
         for k, v in mapping.items():
             local = int(k)
             abs_i = start + local - 1
             if 0 <= abs_i < total and isinstance(v, str) and v.strip():
                 out[abs_i] = v.strip()
-                ok += 1
-        if ok >= int(data.get("expected", 0) * 0.95):
+                ok_n += 1
+        if ok_n >= int(data.get("expected", 0) * 0.95):
             done_batches.append(bi)
-            log(f"resume batch {bi+1}/{n_batches}: loaded {ok} lines from checkpoint")
+            info(f"恢复 batch {bi+1}/{n_batches}: 已加载 {ok_n} 行")
 
     if force:
         done_batches = []
         out = [None] * total
-        log("force re-translate all batches")
+        warn("强制重翻全部 batch")
 
     pending = [bi for bi in range(n_batches) if bi not in done_batches]
-    log(f"translate pending batches: {[b+1 for b in pending]} / {n_batches}")
+    highlight(
+        f"待翻 batch {[b+1 for b in pending]}  "
+        f"(已完成 {len(done_batches)}/{n_batches})"
+    )
     state.set_running("translate")
     state.data["stages"]["translate"]["detail"] = {
         "total": total,
@@ -224,7 +241,11 @@ def translate_segments(
         start = bi * batch_size
         chunk = en_texts[start : start + batch_size]
         items = [(i + 1, t) for i, t in enumerate(chunk)]
-        log(f"translate batch {bi+1}/{n_batches}: lines {start+1}-{start+len(chunk)} / {total}")
+        progress(
+            bi + 1,
+            n_batches,
+            f"lines {start+1}-{start+len(chunk)} / {total}",
+        )
         t0 = time.time()
         try:
             # degrade batch size on repeated failure
@@ -232,7 +253,7 @@ def translate_segments(
                 mapped = translate_chunk(settings, items)
             except TranslateError as e:
                 if len(chunk) > 40 and e.retryable:
-                    log(f"  degrade batch {bi+1}: split into smaller chunks")
+                    warn(f"batch {bi+1} 降级拆分重试")
                     mapped = {}
                     sub = 40
                     for sj in range(0, len(chunk), sub):
@@ -254,8 +275,7 @@ def translate_segments(
                 done_batches=[b + 1 for b in done_batches],
                 saved_lines=sum(1 for x in out if x),
             )
-            log(f"RESUME: python job_run.py --work {state.work} --resume")
-            log(f"STATE:  {state.path}")
+            resume_hint(state.work)
             raise
 
         for local_no, zh in mapped.items():
@@ -263,7 +283,7 @@ def translate_segments(
             if 0 <= abs_i < total:
                 out[abs_i] = zh
                 if local_no <= 3 or abs_i % 50 == 0:
-                    log(f"  ZH[{abs_i:04d}] {zh}")
+                    detail(f"ZH[{abs_i:04d}] {zh}")
 
         # checkpoint this batch
         mapping = {
@@ -294,9 +314,9 @@ def translate_segments(
             "done_lines": sum(1 for x in out if x),
         }
         state.save()
-        log(
-            f"  batch {bi+1}/{n_batches} checkpointed "
-            f"{len(mapping)}/{len(chunk)} in {time.time()-t0:.1f}s"
+        highlight(
+            f"batch {bi+1}/{n_batches} 完成  "
+            f"{len(mapping)}/{len(chunk)}  {time.time()-t0:.1f}s"
         )
 
     filled = 0
@@ -308,10 +328,11 @@ def translate_segments(
             fb = drop_fillers(en_texts[i])
             final.append(fb)
             filled += 1
-            log(f"  ZH[{i:04d}] FALLBACK {fb}")
+            warn(f"ZH[{i:04d}] FALLBACK {fb}")
     if filled:
-        log(f"warning: filled {filled} missing translations with fallback")
+        warn(f"有 {filled} 条用英文回填（翻译缺失）")
 
+    highlight(f"翻译完成  lines={total}  fallback={filled}")
     stage_done("translate", f"lines={total} fallback={filled}")
     state.set_done(
         "translate",

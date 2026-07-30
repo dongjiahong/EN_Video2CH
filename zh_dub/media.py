@@ -7,11 +7,11 @@ import wave
 from pathlib import Path
 
 from .config import Settings
-from .logutil import log, stage, stage_done
+from .logutil import detail, highlight, info, ok, skip
 
 
 def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    log("+ " + " ".join(str(c) for c in cmd[:10]) + (" ..." if len(cmd) > 10 else ""))
+    detail("$ " + " ".join(str(c) for c in cmd[:10]) + (" ..." if len(cmd) > 10 else ""))
     return subprocess.run(cmd, check=True, **kwargs)
 
 
@@ -91,17 +91,16 @@ def yt_dlp_format(quality: str) -> str:
 
 
 def download_video(settings: Settings, url: str, work: Path) -> dict:
-    stage("download-video", f"quality={settings.quality}")
+    info(f"下载视频  quality={settings.quality}")
     work.mkdir(parents=True, exist_ok=True)
     fmt = yt_dlp_format(settings.quality)
     env = with_proxy_env(settings.proxy)
     full = work / "source_full.mp4"
     if full.is_file() or (work / "source.mp4").is_file():
-        log("local video exists; skip download")
-        stage_done("download-video", "skipped")
+        skip("本地视频已存在，跳过下载")
         return {"skipped": True, "file": str(full if full.is_file() else work / "source.mp4")}
 
-    log(f"format={fmt}")
+    info(f"yt-dlp format={fmt}")
     run_cmd(
         [
             settings.yt_dlp,
@@ -126,24 +125,22 @@ def download_video(settings: Settings, url: str, work: Path) -> dict:
         raise RuntimeError(f"download finished but missing {full}")
     wh = ffprobe_wh(settings, full)
     size_mb = full.stat().st_size / (1024 * 1024)
-    log(f"resolved {wh or '?'} size={size_mb:.1f}MB")
-    stage_done("download-video", f"res={wh} size={size_mb:.1f}MB")
+    highlight(f"视频已下载  {wh or '?'}  {size_mb:.1f}MB")
     return {"skipped": False, "file": str(full), "res": wh, "size_mb": round(size_mb, 1)}
 
 
 def download_subs(settings: Settings, url: str, work: Path) -> dict:
-    stage("download-subs")
+    info("下载字幕")
     target_vtt = work / "source.en.vtt"
     target_srt = work / "source.en.srt"
     if target_vtt.is_file() or target_srt.is_file():
-        log("local subtitle exists; skip")
-        stage_done("download-subs", "skipped")
+        skip("本地字幕已存在，跳过")
         return {"skipped": True}
 
     full_vtt = work / "source_full.en.vtt"
     if full_vtt.is_file():
         target_vtt.write_bytes(full_vtt.read_bytes())
-        stage_done("download-subs", "copied source_full.en.vtt")
+        ok("字幕已从 source_full.en.vtt 复制")
         return {"skipped": False, "file": str(target_vtt)}
 
     env = with_proxy_env(settings.proxy)
@@ -164,7 +161,7 @@ def download_subs(settings: Settings, url: str, work: Path) -> dict:
     )
     if not target_vtt.is_file() and not target_srt.is_file():
         raise RuntimeError("subtitle download failed")
-    stage_done("download-subs", "done")
+    ok("字幕下载完成")
     return {"skipped": False, "file": str(target_vtt if target_vtt.is_file() else target_srt)}
 
 
@@ -184,7 +181,6 @@ def resolve_video_id(settings: Settings, url: str) -> str:
 
 
 def prepare_source_video(settings: Settings, work: Path, end: float) -> dict:
-    stage("prepare-video")
     full = work / "source_full.mp4"
     src = work / "source.mp4"
     if not full.is_file() and not src.is_file():
@@ -197,20 +193,20 @@ def prepare_source_video(settings: Settings, work: Path, end: float) -> dict:
                 if src.stat().st_size >= full.stat().st_size * 0.9:
                     need = False
             if need:
-                log("full copy source_full.mp4 -> source.mp4")
+                info("全长拷贝 source_full.mp4 -> source.mp4")
                 run_cmd(
                     [settings.ffmpeg, "-y", "-i", str(full), "-c", "copy", str(src)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
             else:
-                log("source.mp4 already full-length")
-        stage_done("prepare-video", "full")
+                skip("source.mp4 已是全长")
+        ok("视频准备完成  mode=full")
         return {"mode": "full", "file": str(src)}
 
     if not full.is_file():
         raise RuntimeError("preview cut requires source_full.mp4")
-    log(f"preview cut 0..{end}s -> source.mp4")
+    info(f"预览裁剪 0..{end}s -> source.mp4")
     run_cmd(
         [
             settings.ffmpeg,
@@ -236,7 +232,7 @@ def prepare_source_video(settings: Settings, work: Path, end: float) -> dict:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    stage_done("prepare-video", f"preview end={end}")
+    ok(f"视频准备完成  mode=preview end={end}")
     return {"mode": "preview", "end": end, "file": str(src)}
 
 

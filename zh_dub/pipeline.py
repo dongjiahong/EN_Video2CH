@@ -21,7 +21,19 @@ from .captions import (
     write_zh_ass,
 )
 from .config import Settings
-from .logutil import log, stage, stage_done, stage_error
+from .logutil import (
+    detail,
+    highlight,
+    info,
+    log,
+    progress,
+    resume_hint,
+    skip,
+    stage,
+    stage_done,
+    stage_error,
+    warn,
+)
 from .media import (
     clear_proxy_env,
     download_subs,
@@ -416,11 +428,11 @@ def build_narration(
         try:
             wav = _ensure_mono_s16_wav(settings, src, wav)
         except Exception as e:  # noqa: BLE001
-            log(f"narration decode fail idx={seg.idx}: {e}")
+            warn(f"旁白解码失败 idx={seg.idx}: {e}")
             continue
         clips.append((wav, float(seg.start)))
 
-    log(f"build narration timeline clips={len(clips)} total_dur={total_dur:.1f}s")
+    info(f"旁白时间线  clips={len(clips)}  total={total_dur:.1f}s")
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     n_samples = max(1, int(round(float(total_dur) * NARRATION_SR)))
     # zeros: ~ total_dur * 24k * 2 bytes (e.g. 4000s ≈ 190MB)
@@ -444,7 +456,7 @@ def build_narration(
             samples = array.array("h")
             samples.frombytes(raw)
         except Exception as e:  # noqa: BLE001
-            log(f"narration skip {wav_path.name}: {e}")
+            warn(f"跳过旁白片段 {wav_path.name}: {e}")
             continue
 
         offset = int(round(start * NARRATION_SR))
@@ -455,7 +467,7 @@ def build_narration(
         buf[offset : offset + n] = samples[:n]
         placed += 1
         if i == 1 or i == len(clips) or i % 100 == 0:
-            log(f"narration place {i}/{len(clips)}")
+            progress(i, len(clips), f"place {wav_path.name}")
 
     with wave.open(str(out_wav), "wb") as out:
         out.setnchannels(1)
@@ -463,9 +475,8 @@ def build_narration(
         out.setframerate(NARRATION_SR)
         out.writeframes(buf.tobytes())
 
-    log(
-        f"narration ready in {time.time()-t0:.1f}s clips={placed}/{len(clips)} "
-        f"-> {out_wav}"
+    highlight(
+        f"旁白完成  {time.time()-t0:.1f}s  clips={placed}/{len(clips)}  -> {out_wav.name}"
     )
 
 
@@ -484,7 +495,7 @@ def mux_video(
     # pin duration to source video so a shorter leftover out/partial encode cannot win
     video_dur = ffprobe_duration(settings, video)
     nar_dur = ffprobe_duration(settings, narration)
-    log(f"mux inputs video={video_dur:.1f}s narration={nar_dur:.1f}s")
+    info(f"合成输入  video={video_dur:.1f}s  narration={nar_dur:.1f}s")
     if nar_dur + 1.0 < video_dur * 0.95:
         raise RuntimeError(
             f"narration shorter than video ({nar_dur:.1f}s < {video_dur:.1f}s); "
@@ -520,7 +531,7 @@ def mux_video(
         f"{video_dur:.3f}",
         str(out),
     ]
-    log(f"ffmpeg mux -> {out}")
+    info(f"ffmpeg mux -> {out.name}")
     t0 = time.time()
     cp = subprocess.run(
         cmd,
@@ -534,7 +545,7 @@ def mux_video(
         print((cp.stderr or "ffmpeg failed")[-2500:], flush=True)
         raise subprocess.CalledProcessError(cp.returncode, cmd, stderr=cp.stderr)
     out_dur = ffprobe_duration(settings, out)
-    log(f"mux finished in {time.time()-t0:.1f}s out_dur={out_dur:.1f}s")
+    highlight(f"合成完成  {time.time()-t0:.1f}s  out={out_dur:.1f}s  -> {out.name}")
     if out_dur + 2.0 < video_dur * 0.98:
         raise RuntimeError(
             f"mux output truncated: out={out_dur:.1f}s source={video_dur:.1f}s"
@@ -638,8 +649,8 @@ class Pipeline:
                     od = ffprobe_duration(self.settings, cand)
                     if sd > 0 and od + 2.0 < sd * 0.98:
                         ok_len = False
-                        log(
-                            f"bootstrap skip compose: {cand.name} "
+                        warn(
+                            f"bootstrap 跳过 compose: {cand.name} "
                             f"{od:.1f}s << source {sd:.1f}s"
                         )
                 except Exception:  # noqa: BLE001
@@ -655,7 +666,7 @@ class Pipeline:
             elif self.state.data.get("status") == "pending":
                 self.state.data["status"] = "running"
             self.state.save()
-            log("bootstrapped job_state from existing artifacts")
+            info("已从现有产物推断 job_state")
 
     def print_status(self) -> None:
         stage("status", str(self.work))
@@ -667,26 +678,29 @@ class Pipeline:
             segs = load_segments(seg_path)
             zh_n = sum(1 for s in segs if (s.zh or "").strip())
             report = validate_tts(self.work, segs)
-            log(
-                f"live: segments={len(segs)} zh={zh_n} "
-                f"audio_ok={report['audio_ok']} missing={len(report['audio_missing'])}"
+            highlight(
+                f"实时检查  segments={len(segs)}  zh={zh_n}  "
+                f"audio_ok={report['audio_ok']}  missing={len(report['audio_missing'])}"
             )
             if report["audio_missing"][:10]:
-                log(f"missing idx sample: {report['audio_missing'][:10]}")
+                warn(f"缺失音频 idx 样例: {report['audio_missing'][:10]}")
 
     def ensure_media_from_url(self, url: str) -> None:
         if self.state.is_done("download") and (
             (self.work / "source_full.mp4").is_file()
             or (self.work / "source.mp4").is_file()
         ):
-            log("download already done")
+            skip("download 已完成")
             return
         self.state.set_running("download")
         try:
+            stage("download")
             clear_proxy_env()  # only yt-dlp uses explicit env proxy
-            info = download_video(self.settings, url, self.work)
+            info_v = download_video(self.settings, url, self.work)
             sub = download_subs(self.settings, url, self.work)
-            self.state.set_done("download", video=info, subs=sub)
+            highlight(f"下载完成  video={info_v}  subs={sub}")
+            self.state.set_done("download", video=info_v, subs=sub)
+            stage_done("download")
         except Exception as e:  # noqa: BLE001
             stage_error("download", str(e))
             self.state.set_failed("download", str(e), retryable=True)
@@ -699,14 +713,17 @@ class Pipeline:
                 full = self.work / "source_full.mp4"
                 src = self.work / "source.mp4"
                 if full.is_file() and src.stat().st_size < full.stat().st_size * 0.9:
-                    log("source.mp4 stale preview; refresh full copy")
+                    warn("source.mp4 像旧预览，重新拷贝全长视频")
                 else:
-                    log("prepare_video already done")
+                    skip("prepare_video 已完成")
                     return
         self.state.set_running("prepare_video")
         try:
-            info = prepare_source_video(self.settings, self.work, self.end)
-            self.state.set_done("prepare_video", **info)
+            stage("prepare_video", f"end={self.end or 'full'}")
+            info_v = prepare_source_video(self.settings, self.work, self.end)
+            highlight(f"视频就绪  {info_v}")
+            self.state.set_done("prepare_video", **info_v)
+            stage_done("prepare_video", f"{info_v}")
         except Exception as e:  # noqa: BLE001
             stage_error("prepare_video", str(e))
             self.state.set_failed("prepare_video", str(e), retryable=True)
@@ -716,13 +733,13 @@ class Pipeline:
         if self.state.is_done("prepare_cues"):
             data = self.state.read_json("cues.json")
             if data:
-                log(f"prepare_cues already done ({len(data)} cues)")
+                skip(f"prepare_cues 已完成  cues={len(data)}")
                 return [(c["start"], c["end"], c["text"]) for c in data]
         self.state.set_running("prepare_cues")
         try:
             stage("prepare_cues")
             sub = resolve_subtitle(self.work)
-            log(f"subtitle source: {sub}")
+            info(f"字幕源  {sub.name}")
             cues = load_cues(sub)
             t0, t1 = 0.0, (1e12 if self.end <= 0 else self.end)
             cues = [
@@ -732,6 +749,7 @@ class Pipeline:
             ]
             payload = [{"start": s, "end": e, "text": t} for s, e, t in cues]
             self.state.write_json("cues.json", payload)
+            highlight(f"解析字幕完成  cues={len(cues)}")
             stage_done("prepare_cues", f"cues={len(cues)}")
             self.state.set_done("prepare_cues", cues=len(cues), subtitle=str(sub))
             return cues
@@ -745,7 +763,7 @@ class Pipeline:
             path = self.state.checkpoint_path("segments_en.json")
             if path.is_file():
                 segs = load_segments(path)
-                log(f"merge already done ({len(segs)} segments)")
+                skip(f"merge 已完成  segments={len(segs)}")
                 return segs
         self.state.set_running("merge")
         try:
@@ -753,12 +771,19 @@ class Pipeline:
             if cues is None:
                 raw = self.state.read_json("cues.json") or []
                 cues = [(c["start"], c["end"], c["text"]) for c in raw]
+            info(f"输入 cues={len(cues)}，开始断句合并")
             segs = merge_cues(cues)
             self.state.write_json("segments_en.json", [s.__dict__ for s in segs])
             # also keep work/segments.json skeleton if absent
             if not (self.work / "segments.json").is_file():
                 save_segments(segs, self.work / "segments.json")
             write_srt(segs, self.work / "en_merged.srt", "en")
+            durs = [s.end - s.start for s in segs] or [0.0]
+            highlight(
+                f"断句完成  segments={len(segs)}  "
+                f"avg={sum(durs)/len(durs):.1f}s  max={max(durs):.1f}s"
+            )
+            detail(f"输出 en_merged.srt / segments_en.json")
             stage_done("merge", f"segments={len(segs)}")
             self.state.set_done("merge", segments=len(segs))
             return segs
@@ -774,7 +799,7 @@ class Pipeline:
             segs2 = load_segments(seg_path)
             zh_n = sum(1 for s in segs2 if (s.zh or "").strip())
             if zh_n >= max(1, int(len(segs2) * 0.98)):
-                log(f"translate already done ({zh_n}/{len(segs2)})")
+                skip(f"translate 已完成  {zh_n}/{len(segs2)}")
                 return segs2
 
         if segs is None:
@@ -826,9 +851,9 @@ class Pipeline:
         if self.state.is_done("tts") and not force:
             report = validate_tts(self.work, windowed)
             if report["pass"]:
-                log(f"tts already done audio_ok={report['audio_ok']}")
+                skip(f"tts 已完成  audio_ok={report['audio_ok']}")
                 return segs
-            log(f"tts marked done but missing={report['audio_missing'][:20]}; repairing")
+            warn(f"tts 标记完成但缺失 {report['audio_missing'][:20]}，开始修复")
 
         self.state.set_running("tts")
         conc = self.settings.tts_concurrency
@@ -837,21 +862,26 @@ class Pipeline:
             f"segments={len(windowed)} voice={self.voice} concurrency={conc} "
             f"max_rate={self.settings.tts_max_rate}",
         )
+        info(
+            f"TTS 开始  segments={len(windowed)}  voice={self.voice}  "
+            f"并发={conc}  max_rate=+{self.settings.tts_max_rate}%"
+        )
         clear_proxy_env()
         t_all = time.time()
         try:
             def on_progress(done: int, total: int, seg: Segment, *, cached: bool) -> None:
                 if cached:
                     if done == 1 or done % 50 == 0 or done == total:
-                        log(f"TTS skip cached {done}/{total} idx={seg.idx:04d}")
+                        progress(done, total, f"cache idx={seg.idx:04d}")
                 elif done == 1 or done == total or done % 25 == 0 or total <= 40:
-                    log(
-                        f"TTS {done}/{total} idx={seg.idx:04d} "
-                        f"dur={seg.tts_dur:.2f}s rate={seg.rate_pct:+d}% {seg.note} "
-                        f":: {seg.zh}"
+                    progress(
+                        done,
+                        total,
+                        f"idx={seg.idx:04d} {seg.tts_dur:.2f}s "
+                        f"rate={seg.rate_pct:+d}% {seg.note} :: {seg.zh[:40]}",
                     )
                 elif done % 5 == 0:
-                    log(f"TTS progress {done}/{total}")
+                    progress(done, total)
                 if done % 20 == 0 or done == total:
                     self.state.data["stages"]["tts"]["detail"] = {
                         "progress": f"{done}/{total}",
@@ -889,10 +919,9 @@ class Pipeline:
             write_srt(merged, self.work / "zh.srt", "zh")
 
             report = validate_tts(self.work, windowed)
-            log(
-                f"tts validate audio_ok={report['audio_ok']}/"
-                f"{report['zh_nonempty']} missing={len(report['audio_missing'])} "
-                f"overflow={report['overflow']}"
+            highlight(
+                f"TTS 校验  audio_ok={report['audio_ok']}/{report['zh_nonempty']}  "
+                f"missing={len(report['audio_missing'])}  overflow={report['overflow']}"
             )
             if not report["pass"]:
                 self.state.set_failed(
@@ -902,7 +931,7 @@ class Pipeline:
                     missing=report["audio_missing"][:50],
                     audio_ok=report["audio_ok"],
                 )
-                log(f"RESUME: python job_run.py --work {self.work} --resume")
+                resume_hint(self.work)
                 raise RuntimeError(
                     f"TTS incomplete: missing {report['audio_missing'][:20]}"
                 )
@@ -930,7 +959,7 @@ class Pipeline:
         if self.state.is_done("narration"):
             p = self.work / "narration.wav"
             if p.is_file() and p.stat().st_size > 1000:
-                log("narration already done")
+                skip("narration 已完成")
                 return p
         self.state.set_running("narration")
         try:
@@ -955,8 +984,9 @@ class Pipeline:
                     f"cannot build narration, missing audio: {report['audio_missing'][:20]}"
                 )
             out = self.work / "narration.wav"
+            info(f"组装旁白  clips={len(use)}  video={total:.1f}s")
             build_narration(self.settings, use, self.work / "audio", out, total)
-            stage_done("narration", f"file={out}")
+            stage_done("narration", f"file={out.name} clips={len(use)}")
             self.state.set_done("narration", file=str(out), clips=len(use), duration=total)
             return out
         except Exception as e:  # noqa: BLE001
@@ -974,16 +1004,16 @@ class Pipeline:
             except Exception:  # noqa: BLE001
                 src_dur, out_dur = 0.0, 0.0
             if src_dur <= 0 or out_dur + 2.0 >= src_dur * 0.98:
-                log(f"compose already done -> {out} ({out_dur:.1f}s)")
+                skip(f"compose 已完成  -> {out.name} ({out_dur:.1f}s)")
                 return out
-            log(
-                f"compose marked done but out truncated "
-                f"({out_dur:.1f}s < source {src_dur:.1f}s); remux"
+            warn(
+                f"compose 标记完成但输出偏短 "
+                f"({out_dur:.1f}s < source {src_dur:.1f}s)，重新合成"
             )
 
         self.state.set_running("compose")
         try:
-            stage("compose", f"out={out}")
+            stage("compose", f"out={out.name}")
             segs = load_segments(self.work / "segments.json")
             narration = self.work / "narration.wav"
             if not video.is_file():
@@ -994,10 +1024,12 @@ class Pipeline:
             write_srt(segs, self.work / "zh.srt", "zh")
             ass_path = self.work / "zh.ass"
             write_zh_ass(segs, ass_path)
+            info(f"烧录字幕 + 混音  segments={len(segs)}")
             mux_video(self.settings, video, narration, out, ass_path, original_volume=0.0)
             size_mb = out.stat().st_size / (1024 * 1024)
             out_dur = ffprobe_duration(self.settings, out)
-            stage_done("compose", f"out={out} size={size_mb:.1f}MB dur={out_dur:.1f}s")
+            highlight(f"成片输出  {out.name}  {size_mb:.1f}MB  {out_dur:.1f}s")
+            stage_done("compose", f"out={out.name} size={size_mb:.1f}MB dur={out_dur:.1f}s")
             self.state.set_done(
                 "compose",
                 out=str(out),
@@ -1076,19 +1108,19 @@ class Pipeline:
             f"out_dur={out_dur:.1f}s",
         )
         if not victims:
-            log("nothing to clean")
+            skip("没有可清理内容")
             stage_done("clean", "already clean")
             return out
 
         if not yes:
             for p in victims[:30]:
                 kind = "dir" if p.is_dir() else "file"
-                log(f"  will remove [{kind}] {p.name}")
+                detail(f"will remove [{kind}] {p.name}")
             if len(victims) > 30:
-                log(f"  ... and {len(victims)-30} more")
-            log("dry-run only; nothing deleted")
-            log(
-                f"confirm out.mp4 is good, then run:\n"
+                detail(f"... and {len(victims)-30} more")
+            warn("dry-run：未删除任何文件")
+            info(
+                f"确认 out.mp4 无误后执行:\n"
                 f"  python job_run.py --work {self.work} --mode clean --yes"
             )
             stage_done("clean", "dry-run")
@@ -1102,15 +1134,17 @@ class Pipeline:
                 else:
                     p.unlink(missing_ok=True)
                 removed += 1
-                log(f"removed {p.name}")
+                detail(f"removed {p.name}")
             except OSError as e:
-                log(f"skip {p.name}: {e}")
+                warn(f"skip {p.name}: {e}")
 
         stage_done(
             "clean",
             f"kept={keep_name} removed={removed} freed~{freed/1024/1024:.0f}MB",
         )
-        log(f"kept: {out} ({out_dur:.1f}s, {out.stat().st_size/1024/1024:.1f}MB)")
+        highlight(
+            f"保留 {out.name}  ({out_dur:.1f}s, {out.stat().st_size/1024/1024:.1f}MB)"
+        )
         return out
 
     def run(
@@ -1125,10 +1159,11 @@ class Pipeline:
         """
         mode: all | prepare | tts-mux | translate | tts | mux | status | clean
         """
-        stage("job-start", f"mode={mode} end={self.end} voice={self.voice}")
+        stage("job-start", f"mode={mode} end={self.end or 'full'} voice={self.voice}")
+        highlight(f"工作目录  {self.work}")
         if force_from:
             self.state.mark_pending_from(force_from)
-            log(f"force from stage: {force_from}")
+            warn(f"强制从阶段重跑: {force_from}")
 
         if url:
             # bind work if empty id folder created by caller
@@ -1139,7 +1174,7 @@ class Pipeline:
             if not resume or not self.state.is_done("download"):
                 self.ensure_media_from_url(url)
             else:
-                log("skip download (resume)")
+                skip("download (resume)")
 
         # always need local media for later steps
         need_media = mode in {"all", "prepare", "tts-mux", "tts", "mux", "translate"}
@@ -1195,7 +1230,7 @@ class Pipeline:
             elif mode == "all":
                 # resume-aware full run
                 nxt = self.state.next_pending() if resume else "download"
-                log(f"resume pointer -> {nxt}")
+                info(f"续跑指针 -> {nxt or '全部完成'}")
                 if url and (not resume or not self.state.is_done("download")):
                     self.ensure_media_from_url(url)
                 self.step_prepare_video()
@@ -1224,8 +1259,7 @@ class Pipeline:
             return out
         except Exception as e:  # noqa: BLE001
             stage_error("job", str(e))
-            log(f"STATE:  {self.state.path}")
-            log(f"RESUME: python job_run.py --work {self.work} --resume")
+            resume_hint(self.work)
             raise
 
 
@@ -1242,5 +1276,6 @@ def resolve_work_dir(settings: Settings, work: str | None, url: str | None) -> P
     vid = resolve_video_id(settings, url)
     p = (settings.workdir / vid).resolve()
     p.mkdir(parents=True, exist_ok=True)
+    highlight(f"视频 ID={vid}")
     stage_done("resolve-id", f"id={vid} work={p}")
     return p
