@@ -1,0 +1,48 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# tooling / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# job runtime data (large media + intermediates)
+work/
+**/audio/
+*.mp4
+*.wav
+*.mp3
+!zh_dub/**
+
+# local logs / backups
+*.log
+*.bak
+*.tmp
+.cache/
