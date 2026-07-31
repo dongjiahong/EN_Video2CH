@@ -48,3 +48,5 @@ assets
 *.bak
 *.tmp
 .cache/
+
+*.txt
