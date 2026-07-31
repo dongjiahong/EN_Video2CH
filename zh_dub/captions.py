@@ -561,17 +561,46 @@ def write_srt(segs: list[Segment], path: Path, field: str = "zh") -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def write_zh_ass(segs: list[Segment], path: Path) -> None:
+def _wrap_zh_line(text: str, max_chars: int = 32) -> str:
+    """Hard-wrap Chinese subtitle text for ASS (\\N). Prefer breaks after punct."""
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or len(text) <= max_chars:
+        return text
+
+    prefer = set("，。！？；：、,.!?;: ")
+    lines: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= max_chars:
+            lines.append(rest)
+            break
+        window = rest[: max_chars + 1]
+        cut = -1
+        # look for punctuation near the end of the window
+        for i in range(max_chars, max(max_chars // 2, 0) - 1, -1):
+            if window[i - 1] in prefer:
+                cut = i
+                break
+        if cut < 0:
+            cut = max_chars
+        piece = rest[:cut].strip()
+        if piece:
+            lines.append(piece)
+        rest = rest[cut:].lstrip()
+    return "\\N".join(lines)
+
+
+def write_zh_ass(segs: list[Segment], path: Path, *, max_chars: int = 32) -> None:
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 640
 PlayResY: 360
-WrapStyle: 0
+WrapStyle: 2
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ZH,PingFang SC,18,&H0000F0FF,&H000000FF,&H00101010,&H00000000,0,0,0,0,100,100,0,0,1,1.6,0,2,16,16,22,1
+Style: ZH,PingFang SC,16,&H0000F0FF,&H000000FF,&H00101010,&H00000000,0,0,0,0,100,100,0,0,1,1.6,0,2,20,20,24,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -591,6 +620,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         zh = (seg.zh or "").replace("\n", " ").replace("{", "(").replace("}", ")").strip()
         if not zh:
             continue
+        zh = _wrap_zh_line(zh, max_chars=max_chars)
         st, et = _ass_ts(seg.start), _ass_ts(seg.end)
         events.append(f"Dialogue: 0,{st},{et},ZH,,0,0,0,,{zh}")
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")

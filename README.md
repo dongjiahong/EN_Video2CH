@@ -62,8 +62,11 @@ cp .env.example .env
 | `WORKDIR` | 任务根目录 | `./work` |
 | `TRANSLATE_BATCH_SIZE` | 翻译批大小 | `100` |
 | `TRANSLATE_MAX_RETRIES` | 单批最大重试 | `5` |
+| `TRANSLATE_CONCURRENCY` | 主翻译 batch 并发（补译在全部主翻结束后） | `2` |
+| `TRANSLATE_REFILL_MAX_ROUNDS` | 补译轮数上限（某轮零进展提前停） | `2` |
 | `TTS_CONCURRENCY` | TTS 并发数（edge 易限流，可调 2～16） | `2` |
 | `TTS_MAX_RATE` | TTS 最大加速百分比 | `30` |
+| `COVER_IMAGE` | 最终成片片头封面图（1 秒；不配则不加） | 空 |
 | `PYTHON`/`YT_DLP`/`FFMPEG`/`FFPROBE`/`EDGE_TTS` | 可选绝对路径 | 自动探测 |
 | `MODELSCOPE_BASE_URL` | 翻译 API base | ModelScope 默认 |
 

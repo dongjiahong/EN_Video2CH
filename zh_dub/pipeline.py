@@ -12,6 +12,7 @@ from typing import Any
 
 from .captions import (
     Segment,
+    drop_fillers,
     load_cues,
     load_segments,
     merge_cues,
@@ -39,6 +40,8 @@ from .media import (
     download_subs,
     download_video,
     ffprobe_duration,
+    ffprobe_fps,
+    ffprobe_wh,
     mp3_to_wav,
     prepare_source_video,
     resolve_video_id,
@@ -480,6 +483,9 @@ def build_narration(
     )
 
 
+COVER_SECONDS = 1.0
+
+
 def mux_video(
     settings: Settings,
     video: Path,
@@ -487,6 +493,7 @@ def mux_video(
     out: Path,
     ass_path: Path | None,
     original_volume: float = 0.0,
+    cover_image: Path | None = None,
 ) -> None:
     video = video.resolve()
     narration = narration.resolve()
@@ -502,35 +509,134 @@ def mux_video(
             "rebuild narration first"
         )
 
-    cmd: list[str] = [settings.ffmpeg, "-y", "-i", str(video), "-i", str(narration)]
-    if original_volume <= 0:
-        cmd += ["-map", "0:v", "-map", "1:a"]
-    else:
+    cover: Path | None = None
+    if cover_image is not None:
+        cand = cover_image.expanduser()
+        if not cand.is_absolute():
+            cand = (settings.root / cand).resolve()
+        else:
+            cand = cand.resolve()
+        if cand.is_file():
+            cover = cand
+            info(f"片头封面  {cover}  +{COVER_SECONDS:.0f}s")
+        else:
+            warn(f"COVER_IMAGE 不存在，跳过封面: {cand}")
+
+    local_ass: Path | None = None
+    if ass_path is not None and ass_path.exists():
+        local_ass = workdir / "_burn.ass"
+        local_ass.write_text(ass_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    if cover is None:
+        cmd: list[str] = [
+            settings.ffmpeg,
+            "-y",
+            "-i",
+            str(video),
+            "-i",
+            str(narration),
+        ]
+        if original_volume <= 0:
+            cmd += ["-map", "0:v", "-map", "1:a"]
+        else:
+            cmd += [
+                "-filter_complex",
+                f"[0:a]volume={original_volume}[a0];"
+                f"[a0][1:a]amix=inputs=2:normalize=0[aout]",
+                "-map",
+                "0:v",
+                "-map",
+                "[aout]",
+            ]
+        if local_ass is not None:
+            cmd += [
+                "-vf",
+                f"ass={local_ass.name}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+            ]
+        else:
+            cmd += ["-c:v", "copy"]
+        expected_dur = video_dur
         cmd += [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-t",
+            f"{expected_dur:.3f}",
+            str(out),
+        ]
+    else:
+        wh = ffprobe_wh(settings, video) or "1280x720"
+        try:
+            w_s, h_s = wh.lower().split("x", 1)
+            width, height = int(w_s), int(h_s)
+        except ValueError:
+            width, height = 1280, 720
+        fps = ffprobe_fps(settings, video)
+        fps_s = f"{fps:.3f}".rstrip("0").rstrip(".")
+        # 0=cover still, 1=source video, 2=narration
+        if local_ass is not None:
+            main_v = (
+                f"[1:v]ass={local_ass.name},fps={fps_s},format=yuv420p,"
+                f"setsar=1,setpts=PTS-STARTPTS[mainv]"
+            )
+        else:
+            main_v = (
+                f"[1:v]fps={fps_s},format=yuv420p,setsar=1,setpts=PTS-STARTPTS[mainv]"
+            )
+        fc = (
+            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+            f"fps={fps_s},format=yuv420p,setpts=PTS-STARTPTS[cover];"
+            f"{main_v};"
+            f"[cover][mainv]concat=n=2:v=1:a=0[vout];"
+            f"anullsrc=channel_layout=mono:sample_rate=24000,"
+            f"atrim=0:{COVER_SECONDS:.3f},asetpts=PTS-STARTPTS[asil];"
+            f"[2:a]aformat=sample_fmts=fltp:sample_rates=24000:"
+            f"channel_layouts=mono,asetpts=PTS-STARTPTS[anar];"
+            f"[asil][anar]concat=n=2:v=0:a=1[aout]"
+        )
+        expected_dur = video_dur + COVER_SECONDS
+        cmd = [
+            settings.ffmpeg,
+            "-y",
+            "-loop",
+            "1",
+            "-t",
+            f"{COVER_SECONDS:.3f}",
+            "-i",
+            str(cover),
+            "-i",
+            str(video),
+            "-i",
+            str(narration),
             "-filter_complex",
-            f"[0:a]volume={original_volume}[a0];[a0][1:a]amix=inputs=2:normalize=0[aout]",
+            fc,
             "-map",
-            "0:v",
+            "[vout]",
             "-map",
             "[aout]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-t",
+            f"{expected_dur:.3f}",
+            str(out),
         ]
-    if ass_path is not None and ass_path.exists():
-        local = workdir / "_burn.ass"
-        local.write_text(ass_path.read_text(encoding="utf-8"), encoding="utf-8")
-        cmd += ["-vf", f"ass={local.name}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
-    else:
-        cmd += ["-c:v", "copy"]
-    # Use source duration explicitly. Avoid bare -shortest which can stop early
-    # on odd container timestamps / partial previous encodes.
-    cmd += [
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-t",
-        f"{video_dur:.3f}",
-        str(out),
-    ]
+
     info(f"ffmpeg mux -> {out.name}")
     t0 = time.time()
     cp = subprocess.run(
@@ -546,11 +652,10 @@ def mux_video(
         raise subprocess.CalledProcessError(cp.returncode, cmd, stderr=cp.stderr)
     out_dur = ffprobe_duration(settings, out)
     highlight(f"合成完成  {time.time()-t0:.1f}s  out={out_dur:.1f}s  -> {out.name}")
-    if out_dur + 2.0 < video_dur * 0.98:
+    if out_dur + 2.0 < expected_dur * 0.98:
         raise RuntimeError(
-            f"mux output truncated: out={out_dur:.1f}s source={video_dur:.1f}s"
+            f"mux output truncated: out={out_dur:.1f}s expected={expected_dur:.1f}s"
         )
-
 
 class Pipeline:
     def __init__(self, settings: Settings, work: Path, *, end: float = 0.0, voice: str | None = None):
@@ -609,28 +714,46 @@ class Pipeline:
                     )
                 mark("prepare_cues", inferred=True, segments=len(segs))
                 mark("merge", inferred=True, segments=len(segs))
-                zh_n = sum(1 for s in segs if (s.zh or "").strip())
-                if zh_n >= max(1, int(len(segs) * 0.98)):
-                    mark("translate", inferred=True, total=len(segs), zh=zh_n)
+                zh_n = 0
+                fb_n = 0
+                real_mapping: dict[str, str] = {}
+                for i, s in enumerate(segs):
+                    zh = (s.zh or "").strip()
+                    if not zh:
+                        continue
+                    en_fb = drop_fillers(s.en).strip()
+                    if en_fb and zh.lower() == en_fb.lower():
+                        fb_n += 1
+                        continue
+                    zh_n += 1
+                    real_mapping[str(i + 1)] = zh
+                if zh_n >= max(1, int(len(segs) * 0.98)) and fb_n == 0:
+                    mark(
+                        "translate",
+                        inferred=True,
+                        total=len(segs),
+                        zh=zh_n,
+                    )
                     # seed batch checkpoint so resume won't redo
                     if not list((self.state.checkpoints / "translate").glob("batch_*.json")):
-                        mapping = {
-                            str(i + 1): s.zh
-                            for i, s in enumerate(segs)
-                            if (s.zh or "").strip()
-                        }
-                        (self.state.checkpoints / "translate").mkdir(parents=True, exist_ok=True)
+                        (self.state.checkpoints / "translate").mkdir(
+                            parents=True, exist_ok=True
+                        )
                         self.state.write_json(
                             "translate/batch_000.json",
                             {
                                 "batch_index": 0,
                                 "start": 0,
                                 "expected": len(segs),
-                                "got": len(mapping),
-                                "mapping": mapping,
+                                "got": len(real_mapping),
+                                "mapping": real_mapping,
                                 "inferred": True,
                             },
                         )
+                elif fb_n:
+                    warn(
+                        f"bootstrap: {fb_n} 条疑似英文回填，translate 不标记完成"
+                    )
                 report = validate_tts(self.work, segs)
                 if report["pass"]:
                     mark("tts", inferred=True, audio_ok=report["audio_ok"])
@@ -798,9 +921,22 @@ class Pipeline:
         if self.state.is_done("translate") and seg_path.is_file() and not force:
             segs2 = load_segments(seg_path)
             zh_n = sum(1 for s in segs2 if (s.zh or "").strip())
-            if zh_n >= max(1, int(len(segs2) * 0.98)):
+            # English fallback is drop_fillers(en) written into zh — still needs refill
+            fb_n = sum(
+                1
+                for s in segs2
+                if (s.zh or "").strip()
+                and drop_fillers(s.en).strip().lower()
+                == (s.zh or "").strip().lower()
+            )
+            if zh_n >= max(1, int(len(segs2) * 0.98)) and fb_n == 0:
                 skip(f"translate 已完成  {zh_n}/{len(segs2)}")
                 return segs2
+            if fb_n:
+                warn(f"发现 {fb_n} 条疑似英文回填，重新进入翻译补译")
+                # allow translate_segments to run even though stage was marked done
+                self.state.data["stages"]["translate"]["status"] = "pending"
+                self.state.save()
 
         if segs is None:
             en_path = self.state.checkpoint_path("segments_en.json")
@@ -811,13 +947,18 @@ class Pipeline:
             else:
                 raise RuntimeError("no segments to translate; run merge first")
 
-        # bootstrap checkpoints from existing segments.json zh if present
+        # bootstrap real zh from existing segments.json (skip English fallback leftovers)
         if seg_path.is_file() and not force:
             old = load_segments(seg_path)
             if len(old) == len(segs):
                 for a, b in zip(segs, old):
-                    if (b.zh or "").strip() and not (a.zh or "").strip():
-                        a.zh = b.zh
+                    zh = (b.zh or "").strip()
+                    if not zh or (a.zh or "").strip():
+                        continue
+                    en_fb = drop_fillers(b.en).strip()
+                    if en_fb and zh.lower() == en_fb.lower():
+                        continue
+                    a.zh = zh
 
         try:
             zhs = translate_segments(
@@ -997,19 +1138,30 @@ class Pipeline:
     def step_compose(self, out_name: str | None = None) -> Path:
         out = self.work / (out_name or ("out_preview.mp4" if self.end > 0 else "out.mp4"))
         video = self.work / "source.mp4"
+        cover = self.settings.cover_image
+        cover_ok = bool(cover and cover.is_file())
         if self.state.is_done("compose") and out.is_file() and out.stat().st_size > 1000:
             try:
                 src_dur = ffprobe_duration(self.settings, video) if video.is_file() else 0.0
                 out_dur = ffprobe_duration(self.settings, out)
             except Exception:  # noqa: BLE001
                 src_dur, out_dur = 0.0, 0.0
-            if src_dur <= 0 or out_dur + 2.0 >= src_dur * 0.98:
-                skip(f"compose 已完成  -> {out.name} ({out_dur:.1f}s)")
-                return out
-            warn(
-                f"compose 标记完成但输出偏短 "
-                f"({out_dur:.1f}s < source {src_dur:.1f}s)，重新合成"
-            )
+            expect = src_dur + (COVER_SECONDS if cover_ok else 0.0)
+            if src_dur > 0 and out_dur + 2.0 >= expect * 0.98:
+                # if cover newly configured, old out without +1s should rebuild
+                if cover_ok and out_dur + 0.5 < src_dur + COVER_SECONDS * 0.9:
+                    warn(
+                        f"compose 已完成但缺少片头封面 "
+                        f"({out_dur:.1f}s < source+cover {expect:.1f}s)，重新合成"
+                    )
+                else:
+                    skip(f"compose 已完成  -> {out.name} ({out_dur:.1f}s)")
+                    return out
+            elif src_dur > 0:
+                warn(
+                    f"compose 标记完成但输出偏短 "
+                    f"({out_dur:.1f}s < expected {expect:.1f}s)，重新合成"
+                )
 
         self.state.set_running("compose")
         try:
@@ -1024,8 +1176,20 @@ class Pipeline:
             write_srt(segs, self.work / "zh.srt", "zh")
             ass_path = self.work / "zh.ass"
             write_zh_ass(segs, ass_path)
-            info(f"烧录字幕 + 混音  segments={len(segs)}")
-            mux_video(self.settings, video, narration, out, ass_path, original_volume=0.0)
+            cover = self.settings.cover_image
+            if cover:
+                info(f"烧录字幕 + 混音 + 封面  segments={len(segs)}  cover={cover}")
+            else:
+                info(f"烧录字幕 + 混音  segments={len(segs)}")
+            mux_video(
+                self.settings,
+                video,
+                narration,
+                out,
+                ass_path,
+                original_volume=0.0,
+                cover_image=cover,
+            )
             size_mb = out.stat().st_size / (1024 * 1024)
             out_dur = ffprobe_duration(self.settings, out)
             highlight(f"成片输出  {out.name}  {size_mb:.1f}MB  {out_dur:.1f}s")
@@ -1035,6 +1199,7 @@ class Pipeline:
                 out=str(out),
                 size_mb=round(size_mb, 1),
                 duration=round(out_dur, 3),
+                cover=str(cover) if cover else "",
             )
             return out
         except Exception as e:  # noqa: BLE001
@@ -1238,8 +1403,8 @@ class Pipeline:
                     self.step_prepare_cues()
                 if not self.state.is_done("merge"):
                     self.step_merge()
-                if not self.state.is_done("translate"):
-                    self.step_translate()
+                # self-skips when truly done; also heals English fallback leftovers
+                self.step_translate()
                 if not self.state.is_done("tts"):
                     self.step_tts()
                 if not self.state.is_done("narration"):

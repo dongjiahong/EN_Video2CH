@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .captions import drop_fillers, parse_numbered_zh
@@ -34,6 +35,16 @@ def _client(settings: Settings):
 
     clear_proxy_env()
     return OpenAI(api_key=settings.api_key, base_url=settings.modelscope_base_url)
+
+
+def _is_english_fallback(zh: str | None, en: str) -> bool:
+    """True when zh is just the English fallback (drop_fillers(en))."""
+    if not zh or not str(zh).strip():
+        return False
+    en_fb = drop_fillers(en).strip()
+    if not en_fb:
+        return False
+    return zh.strip().lower() == en_fb.lower()
 
 
 def translate_chunk(
@@ -176,6 +187,33 @@ def translate_chunk(
     )
 
 
+def _run_one_batch(
+    settings: Settings,
+    bi: int,
+    chunk: list[str],
+) -> tuple[int, dict[int, str], float]:
+    """Translate one batch (with optional size degrade). Returns (bi, mapped, elapsed)."""
+    items = [(i + 1, t) for i, t in enumerate(chunk)]
+    t0 = time.time()
+    try:
+        mapped = translate_chunk(settings, items)
+    except TranslateError as e:
+        if len(chunk) > 40 and e.retryable:
+            warn(f"batch {bi+1} 降级拆分重试")
+            mapped = {}
+            sub = 40
+            for sj in range(0, len(chunk), sub):
+                sub_items = [
+                    (i + 1, t) for i, t in enumerate(chunk[sj : sj + sub])
+                ]
+                part = translate_chunk(settings, sub_items)
+                for local_no, zh in part.items():
+                    mapped[sj + local_no] = zh
+        else:
+            raise
+    return bi, mapped, time.time() - t0
+
+
 def translate_segments(
     settings: Settings,
     state: JobState,
@@ -183,20 +221,23 @@ def translate_segments(
     *,
     force: bool = False,
 ) -> list[str]:
-    """Batch translate with per-batch checkpoints and resume."""
+    """Batch translate with per-batch checkpoints, concurrency, and post refill."""
     total = len(en_texts)
     batch_size = max(1, settings.translate_batch_size)
+    concurrency = max(1, settings.translate_concurrency)
     n_batches = (total + batch_size - 1) // batch_size if total else 0
     stage(
         "translate",
-        f"total={total} batches={n_batches} size={batch_size} model={settings.model}",
+        f"total={total} batches={n_batches} size={batch_size} "
+        f"concurrency={concurrency} model={settings.model}",
     )
     info(
         f"翻译启动  lines={total}  batches={n_batches}  "
-        f"batch_size={batch_size}  model={settings.model}"
+        f"batch_size={batch_size}  concurrency={concurrency}  model={settings.model}"
     )
     out: list[str | None] = [None] * total
     done_batches: list[int] = []
+    lock = threading.Lock()
 
     # load existing batch checkpoints
     for bi in range(n_batches):
@@ -211,118 +252,269 @@ def translate_segments(
             local = int(k)
             abs_i = start + local - 1
             if 0 <= abs_i < total and isinstance(v, str) and v.strip():
+                # skip English fallback leftovers stored as "translation"
+                if _is_english_fallback(v, en_texts[abs_i]):
+                    continue
                 out[abs_i] = v.strip()
                 ok_n += 1
-        if ok_n >= int(data.get("expected", 0) * 0.95):
+        expected = int(data.get("expected", 0))
+        # only treat batch as done if enough real zh (not English fallback)
+        if expected > 0 and ok_n >= int(expected * 0.95):
             done_batches.append(bi)
             info(f"恢复 batch {bi+1}/{n_batches}: 已加载 {ok_n} 行")
+        elif ok_n:
+            info(f"恢复 batch {bi+1}/{n_batches}: 部分 {ok_n}/{expected}，将重翻缺失")
+
+    # load previous refill results (absolute index -> zh)
+    if not force:
+        refill_data = state.read_json("translate/refill.json") or {}
+        refill_map = refill_data.get("mapping") or {}
+        loaded_refill = 0
+        for k, v in refill_map.items():
+            abs_i = int(k)
+            if 0 <= abs_i < total and isinstance(v, str) and v.strip():
+                if _is_english_fallback(v, en_texts[abs_i]):
+                    continue
+                if not out[abs_i]:
+                    out[abs_i] = v.strip()
+                    loaded_refill += 1
+        if loaded_refill:
+            info(f"恢复二次补译: 已加载 {loaded_refill} 行")
 
     if force:
         done_batches = []
         out = [None] * total
+        refill_path = state.checkpoint_path("translate/refill.json")
+        if refill_path.is_file():
+            refill_path.unlink()
         warn("强制重翻全部 batch")
+
+    # Treat English fallback leftovers as missing so second-pass refill can fix them
+    cleared_fb = 0
+    for i, zh in enumerate(out):
+        if _is_english_fallback(zh, en_texts[i]):
+            out[i] = None
+            cleared_fb += 1
+    if cleared_fb:
+        warn(f"清除 {cleared_fb} 条英文回填，准备二次补译")
 
     pending = [bi for bi in range(n_batches) if bi not in done_batches]
     highlight(
         f"待翻 batch {[b+1 for b in pending]}  "
-        f"(已完成 {len(done_batches)}/{n_batches})"
+        f"(已完成 {len(done_batches)}/{n_batches}, 并发={concurrency})"
     )
     state.set_running("translate")
     state.data["stages"]["translate"]["detail"] = {
         "total": total,
         "batch_size": batch_size,
         "n_batches": n_batches,
+        "concurrency": concurrency,
         "done_batches": [b + 1 for b in done_batches],
         "pending_batches": [b + 1 for b in pending],
     }
     state.save()
 
-    for bi in pending:
+    def _commit_batch(bi: int, mapped: dict[int, str], elapsed: float) -> None:
         start = bi * batch_size
-        chunk = en_texts[start : start + batch_size]
-        items = [(i + 1, t) for i, t in enumerate(chunk)]
-        progress(
-            bi + 1,
-            n_batches,
-            f"lines {start+1}-{start+len(chunk)} / {total}",
+        chunk_len = min(batch_size, total - start)
+        with lock:
+            mapping: dict[str, str] = {}
+            for local_no, zh in mapped.items():
+                if not isinstance(zh, str) or not zh.strip():
+                    continue
+                abs_i = start + local_no - 1
+                if not (0 <= abs_i < total):
+                    continue
+                if _is_english_fallback(zh, en_texts[abs_i]):
+                    continue
+                text = zh.strip()
+                out[abs_i] = text
+                mapping[str(local_no)] = text
+                if local_no <= 3 or abs_i % 50 == 0:
+                    detail(f"ZH[{abs_i:04d}] {text}")
+
+            state.write_json(
+                f"translate/batch_{bi:03d}.json",
+                {
+                    "batch_index": bi,
+                    "start": start,
+                    "expected": chunk_len,
+                    "got": len(mapping),
+                    "elapsed_s": round(elapsed, 2),
+                    "mapping": mapping,
+                },
+            )
+            if bi not in done_batches:
+                done_batches.append(bi)
+            state.data["stages"]["translate"]["detail"] = {
+                "total": total,
+                "batch_size": batch_size,
+                "n_batches": n_batches,
+                "concurrency": concurrency,
+                "done_batches": [b + 1 for b in sorted(done_batches)],
+                "pending_batches": [
+                    b + 1 for b in range(n_batches) if b not in done_batches
+                ],
+                "done_lines": sum(1 for x in out if x),
+            }
+            state.save()
+            highlight(
+                f"batch {bi+1}/{n_batches} 完成  "
+                f"{len(mapping)}/{chunk_len}  {elapsed:.1f}s"
+            )
+
+    if pending:
+        workers = min(concurrency, len(pending))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            for bi in pending:
+                start = bi * batch_size
+                chunk = en_texts[start : start + batch_size]
+                progress(
+                    len(done_batches) + 1,
+                    n_batches,
+                    f"提交 batch {bi+1}  lines {start+1}-{start+len(chunk)}",
+                )
+                fut = pool.submit(_run_one_batch, settings, bi, chunk)
+                futures[fut] = bi
+
+            for fut in as_completed(futures):
+                bi = futures[fut]
+                try:
+                    bi2, mapped, elapsed = fut.result()
+                    _commit_batch(bi2, mapped, elapsed)
+                except Exception as e:  # noqa: BLE001
+                    for other in futures:
+                        other.cancel()
+                    stage_error("translate", f"batch {bi+1}/{n_batches}: {e}")
+                    state.set_failed(
+                        "translate",
+                        str(e),
+                        retryable=True,
+                        batch=bi + 1,
+                        done_batches=[b + 1 for b in done_batches],
+                        saved_lines=sum(1 for x in out if x),
+                    )
+                    resume_hint(state.work)
+                    raise
+
+    # After ALL main batches finish: multi-round refill for missing lines
+    def _missing_idxs() -> list[int]:
+        return [
+            i
+            for i, zh in enumerate(out)
+            if not (zh and str(zh).strip())
+            or _is_english_fallback(zh, en_texts[i])
+        ]
+
+    refill_max_rounds = max(0, settings.translate_refill_max_rounds)
+    refilled = 0
+    rounds_ran = 0
+    refill_mapping: dict[str, str] = {}
+    prev_refill = state.read_json("translate/refill.json") or {}
+    for k, v in (prev_refill.get("mapping") or {}).items():
+        abs_i = int(k)
+        if (
+            0 <= abs_i < total
+            and isinstance(v, str)
+            and v.strip()
+            and out[abs_i]
+            and not _is_english_fallback(v, en_texts[abs_i])
+        ):
+            refill_mapping[str(abs_i)] = v.strip()
+
+    for round_i in range(1, refill_max_rounds + 1):
+        missing_idxs = _missing_idxs()
+        for i in missing_idxs:
+            out[i] = None
+        if not missing_idxs:
+            if round_i == 1:
+                info("无需补译：主翻译无缺失")
+            break
+
+        refill_batch = min(batch_size, 40)
+        n_refill = (len(missing_idxs) + refill_batch - 1) // refill_batch
+        highlight(
+            f"补译第 {round_i}/{refill_max_rounds} 轮  "
+            f"missing={len(missing_idxs)}  batches={n_refill}  size={refill_batch}"
         )
-        t0 = time.time()
-        try:
-            # degrade batch size on repeated failure
+        round_got = 0
+        for ri in range(n_refill):
+            group = missing_idxs[ri * refill_batch : (ri + 1) * refill_batch]
+            items = [(j + 1, en_texts[abs_i]) for j, abs_i in enumerate(group)]
+            progress(
+                ri + 1,
+                n_refill,
+                f"R{round_i} 补译 lines {[g + 1 for g in group[:5]]}"
+                + ("..." if len(group) > 5 else ""),
+            )
+            t0 = time.time()
             try:
                 mapped = translate_chunk(settings, items)
-            except TranslateError as e:
-                if len(chunk) > 40 and e.retryable:
-                    warn(f"batch {bi+1} 降级拆分重试")
-                    mapped = {}
-                    sub = 40
-                    for sj in range(0, len(chunk), sub):
-                        sub_items = [
-                            (i + 1, t) for i, t in enumerate(chunk[sj : sj + sub])
-                        ]
-                        part = translate_chunk(settings, sub_items)
-                        for local_no, zh in part.items():
-                            mapped[sj + local_no] = zh
-                else:
-                    raise
-        except Exception as e:  # noqa: BLE001
-            stage_error("translate", f"batch {bi+1}/{n_batches}: {e}")
-            state.set_failed(
-                "translate",
-                str(e),
-                retryable=True,
-                batch=bi + 1,
-                done_batches=[b + 1 for b in done_batches],
-                saved_lines=sum(1 for x in out if x),
+            except Exception as e:  # noqa: BLE001
+                warn(
+                    f"补译 R{round_i} batch {ri+1}/{n_refill} 失败: {e}"
+                )
+                continue
+
+            got = 0
+            for local_no, zh in mapped.items():
+                if not (1 <= local_no <= len(group)):
+                    continue
+                if not isinstance(zh, str) or not zh.strip():
+                    continue
+                abs_i = group[local_no - 1]
+                if _is_english_fallback(zh, en_texts[abs_i]):
+                    continue
+                out[abs_i] = zh.strip()
+                refill_mapping[str(abs_i)] = zh.strip()
+                refilled += 1
+                got += 1
+                round_got += 1
+                detail(f"REFILL R{round_i} ZH[{abs_i:04d}] {zh.strip()}")
+
+            state.write_json(
+                "translate/refill.json",
+                {
+                    "round": round_i,
+                    "max_rounds": refill_max_rounds,
+                    "missing": len(missing_idxs),
+                    "refilled": len(refill_mapping),
+                    "mapping": refill_mapping,
+                },
             )
-            resume_hint(state.work)
-            raise
+            highlight(
+                f"补译 R{round_i} batch {ri+1}/{n_refill} 完成  "
+                f"{got}/{len(group)}  {time.time()-t0:.1f}s"
+            )
 
-        for local_no, zh in mapped.items():
-            abs_i = start + local_no - 1
-            if 0 <= abs_i < total:
-                out[abs_i] = zh
-                if local_no <= 3 or abs_i % 50 == 0:
-                    detail(f"ZH[{abs_i:04d}] {zh}")
-
-        # checkpoint this batch
-        mapping = {
-            str(local_no): zh
-            for local_no, zh in mapped.items()
-            if isinstance(zh, str) and zh.strip()
-        }
-        state.write_json(
-            f"translate/batch_{bi:03d}.json",
-            {
-                "batch_index": bi,
-                "start": start,
-                "expected": len(chunk),
-                "got": len(mapping),
-                "elapsed_s": round(time.time() - t0, 2),
-                "mapping": mapping,
-            },
-        )
-        done_batches.append(bi)
-        state.data["stages"]["translate"]["detail"] = {
-            "total": total,
-            "batch_size": batch_size,
-            "n_batches": n_batches,
-            "done_batches": [b + 1 for b in sorted(done_batches)],
-            "pending_batches": [
-                b + 1 for b in range(n_batches) if b not in done_batches
-            ],
-            "done_lines": sum(1 for x in out if x),
-        }
-        state.save()
+        rounds_ran = round_i
+        still = len(_missing_idxs())
         highlight(
-            f"batch {bi+1}/{n_batches} 完成  "
-            f"{len(mapping)}/{len(chunk)}  {time.time()-t0:.1f}s"
+            f"补译第 {round_i}/{refill_max_rounds} 轮结束  "
+            f"本轮+{round_got}  still_missing={still}"
+        )
+        if still == 0:
+            info(f"补译完成：第 {round_i} 轮后已无缺失")
+            break
+        if round_got == 0:
+            warn(
+                f"补译第 {round_i} 轮零进展，停止后续轮次 "
+                f"(still_missing={still})"
+            )
+            break
+
+    still_after = len(_missing_idxs())
+    if rounds_ran:
+        highlight(
+            f"补译结束  rounds={rounds_ran}/{refill_max_rounds}  "
+            f"refilled={refilled}  still_missing={still_after}"
         )
 
     filled = 0
     final: list[str] = []
     for i, zh in enumerate(out):
-        if zh and zh.strip():
+        if zh and zh.strip() and not _is_english_fallback(zh, en_texts[i]):
             final.append(zh.strip())
         else:
             fb = drop_fillers(en_texts[i])
@@ -331,13 +523,26 @@ def translate_segments(
             warn(f"ZH[{i:04d}] FALLBACK {fb}")
     if filled:
         warn(f"有 {filled} 条用英文回填（翻译缺失）")
+    elif refilled:
+        info(f"补译已补回 {refilled} 条，无英文回填")
 
-    highlight(f"翻译完成  lines={total}  fallback={filled}")
-    stage_done("translate", f"lines={total} fallback={filled}")
+    highlight(
+        f"翻译完成  lines={total}  fallback={filled}  refilled={refilled}  "
+        f"refill_rounds={rounds_ran}/{refill_max_rounds}  concurrency={concurrency}"
+    )
+    stage_done(
+        "translate",
+        f"lines={total} fallback={filled} refilled={refilled} "
+        f"refill_rounds={rounds_ran}/{refill_max_rounds} concurrency={concurrency}",
+    )
     state.set_done(
         "translate",
         total=total,
         fallback=filled,
+        refilled=refilled,
+        refill_rounds=rounds_ran,
+        refill_max_rounds=refill_max_rounds,
+        concurrency=concurrency,
         done_batches=[b + 1 for b in sorted(done_batches)],
     )
     return final

@@ -149,8 +149,11 @@ class Settings:
     modelscope_base_url: str
     translate_batch_size: int
     translate_max_retries: int
+    translate_concurrency: int
+    translate_refill_max_rounds: int
     tts_concurrency: int
     tts_max_rate: int
+    cover_image: Path | None
     env_files: list[Path]
 
     @classmethod
@@ -176,6 +179,16 @@ class Settings:
         model = (os.getenv("MODEL") or "").strip()
         if not api_key or not model:
             raise SystemExit(f"缺少 API_KEY / MODEL，请写在 {root / '.env'}")
+
+        cover_raw = (os.getenv("COVER_IMAGE") or "").strip()
+        cover_image: Path | None = None
+        if cover_raw:
+            cover_path = Path(os.path.expanduser(cover_raw))
+            if not cover_path.is_absolute():
+                cover_path = (root / cover_path).resolve()
+            else:
+                cover_path = cover_path.resolve()
+            cover_image = cover_path
 
         return cls(
             root=root,
@@ -204,7 +217,14 @@ class Settings:
             ).strip(),
             translate_batch_size=int(os.getenv("TRANSLATE_BATCH_SIZE") or "100"),
             translate_max_retries=int(os.getenv("TRANSLATE_MAX_RETRIES") or "5"),
+            translate_concurrency=max(
+                1, int(os.getenv("TRANSLATE_CONCURRENCY") or "2")
+            ),
+            translate_refill_max_rounds=max(
+                0, int(os.getenv("TRANSLATE_REFILL_MAX_ROUNDS") or "2")
+            ),
             tts_concurrency=max(1, int(os.getenv("TTS_CONCURRENCY") or "2")),
             tts_max_rate=max(0, int(os.getenv("TTS_MAX_RATE") or "30")),
+            cover_image=cover_image,
             env_files=env_files,
         )

@@ -75,6 +75,45 @@ def ffprobe_wh(settings: Settings, path: Path) -> str:
     return (cp.stdout or "").strip()
 
 
+def ffprobe_fps(settings: Settings, path: Path) -> float:
+    """Best-effort average/real fps; fallback 30."""
+    cp = subprocess.run(
+        [
+            settings.ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate,r_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    for line in (cp.stdout or "").splitlines():
+        s = line.strip()
+        if not s or s == "0/0":
+            continue
+        try:
+            if "/" in s:
+                a, b = s.split("/", 1)
+                den = float(b)
+                if den == 0:
+                    continue
+                fps = float(a) / den
+            else:
+                fps = float(s)
+            if 1.0 <= fps <= 120.0:
+                return fps
+        except ValueError:
+            continue
+    return 30.0
+
+
 def wav_duration(path: Path) -> float:
     with wave.open(str(path), "rb") as w:
         return w.getnframes() / float(w.getframerate())

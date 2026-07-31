@@ -41,6 +41,7 @@ work/
 *.mp3
 !zh_dub/**
 zh_dub/__pycache__/
+assets
 
 # local logs / backups
 *.log
