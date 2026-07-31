@@ -66,7 +66,7 @@ def translate_chunk(
         "1) 严格保留编号，每行一条，格式只能是：`N. 中文`\n"
         "2) 不要时间戳、不要解释、不要合并或删除条目；输出条数必须等于输入条数\n"
         "3) 去掉 um/you know/okay/I mean 等填充词\n"
-        "4) 中文比英文略压缩，适合配音\n"
+        "4) 由于需要配音，你需要考虑中文和英文的语音长度的问题，适当调整翻译内容，让翻译的配音时长尽可能一致，中文可以略微短一点点。\n"
         "5) 最终只输出编号译文，不要输出思考过程或其它内容\n"
     )
     user = (
@@ -157,7 +157,7 @@ def translate_chunk(
             warn(f"翻译尝试 {attempt} 失败: {e}")
             if not e.retryable:
                 raise
-            time.sleep(1.5 * attempt)
+            time.sleep(5 * attempt)
         except Exception as e:  # noqa: BLE001
             last_err = e
             msg = str(e)
@@ -168,7 +168,7 @@ def translate_chunk(
             warn(f"翻译尝试 {attempt} 失败: {e}")
             if not retryable:
                 raise TranslateError(msg, retryable=False) from e
-            time.sleep(1.5 * attempt)
+            time.sleep(5 * attempt)
 
     raise TranslateError(
         f"ModelScope translate failed after {retries} attempts: {last_err}",
