@@ -37,6 +37,7 @@ cd /path/to/MyRose
 conda activate python3          # 本机默认环境
 python -m pip install -r requirements.txt
 # 系统还需: yt-dlp, ffmpeg(libass), ffprobe
+#macos brew install yt-dlp ffmpeg-full
 # edge-tts 装在该 conda 环境里
 ```
 
