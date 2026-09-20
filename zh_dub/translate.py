@@ -47,6 +47,36 @@ def _is_english_fallback(zh: str | None, en: str) -> bool:
     return zh.strip().lower() == en_fb.lower()
 
 
+def translate_title(settings: Settings, title_en: str) -> str:
+    """Translate a video title to short Chinese. Failure should be handled by caller."""
+    text = (title_en or "").strip()
+    if not text:
+        return text
+    client = _client(settings)
+    resp = client.chat.completions.create(
+        model=settings.model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "把英文视频标题译成简洁中文标题。"
+                    "只输出标题本身，不要引号、句号或解释。"
+                    "专有名词和价格行为术语保持准确。"
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+        temperature=0.2,
+    )
+    zh = ""
+    if resp is not None and getattr(resp, "choices", None):
+        msg = resp.choices[0].message
+        if msg is not None:
+            zh = (msg.content or "").strip()
+    zh = zh.strip("\"'“” 。. ")
+    return zh or text
+
+
 def translate_chunk(
     settings: Settings,
     items: list[tuple[int, str]],

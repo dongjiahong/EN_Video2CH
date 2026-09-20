@@ -154,6 +154,7 @@ class Settings:
     tts_concurrency: int
     tts_max_rate: int
     cover_image: Path | None
+    output_dir: Path | None
     env_files: list[Path]
 
     @classmethod
@@ -189,6 +190,16 @@ class Settings:
             else:
                 cover_path = cover_path.resolve()
             cover_image = cover_path
+
+        output_raw = (os.getenv("OUTPUT_DIR") or "").strip()
+        output_dir: Path | None = None
+        if output_raw:
+            output_path = Path(os.path.expanduser(output_raw))
+            if not output_path.is_absolute():
+                output_path = (root / output_path).resolve()
+            else:
+                output_path = output_path.resolve()
+            output_dir = output_path
 
         return cls(
             root=root,
@@ -226,5 +237,6 @@ class Settings:
             tts_concurrency=max(1, int(os.getenv("TTS_CONCURRENCY") or "2")),
             tts_max_rate=max(0, int(os.getenv("TTS_MAX_RATE") or "30")),
             cover_image=cover_image,
+            output_dir=output_dir,
             env_files=env_files,
         )

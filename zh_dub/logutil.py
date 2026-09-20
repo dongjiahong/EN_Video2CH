@@ -37,6 +37,10 @@ STAGE_LABELS: dict[str, str] = {
     "tts": "语音合成",
     "narration": "旁白时间线",
     "compose": "合成成片",
+    "playlist": "展开播放列表",
+    "batch": "批量任务",
+    "batch-item": "批量条目",
+    "export": "导出成片",
 }
 
 

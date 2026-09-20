@@ -19,6 +19,8 @@ MyRose/
     translate.py       # 翻译（并发 batch + 多轮补译）
     captions.py        # 字幕解析 / ASS 换行
     media.py           # 下载 / ffmpeg / tts
+    sources.py         # 播放列表展开 / 输出目录
+    export.py          # 中文标题命名并导出成品
   work/<id>/           # 每个任务工作区
     job_state.json
     checkpoints/
@@ -26,6 +28,7 @@ MyRose/
     audio/
     narration.wav
     out.mp4
+  output/              # 可选：--output / OUTPUT_DIR，中文标题成品
   video_list.txt       # 可选：批量 URL 列表
   video_failed.txt     # 可选：批量失败记录（自动生成）
 ```
@@ -64,6 +67,7 @@ cp .env.example .env
 | `VOICE` | TTS 音色 | `zh-CN-YunyangNeural` |
 | `QUALITY` | `720` / `1080` / `best` | `720` |
 | `WORKDIR` | 任务根目录 | `./work` |
+| `OUTPUT_DIR` | 成品导出目录（中文标题命名；不配则不额外导出） | 空 |
 | `TRANSLATE_BATCH_SIZE` | 翻译批大小 | `100` |
 | `TRANSLATE_MAX_RETRIES` | 单批最大重试 | `5` |
 | `TRANSLATE_CONCURRENCY` | 主翻译 batch 并发（补译在全部主翻结束后） | `2` |
@@ -93,10 +97,12 @@ python job_run.py --help
 
 | 参数 | 说明 |
 |---|---|
-| `--url URL` | YouTube 链接；不写 `--work` 时自动解析 id 建 `work/<id>` |
+| `--url URL` | YouTube 单条或**播放列表**；播放列表会展开后逐条跑；不写 `--work` 时按 id 建 `work/<id>` |
 | `--work DIR` | 已有任务目录（相对路径相对项目根） |
 | `-f` / `--file LIST` | 批量 URL 列表（每行一个）；失败写入同目录 `video_failed.txt`，**不重试** |
 | `--failed-file PATH` | 自定义失败列表路径（默认 `<list_dir>/video_failed.txt`） |
+| `--output DIR` | 把成品复制/硬链到该目录，文件名 `<中文标题> [id].mp4`（覆盖 `.env` 的 `OUTPUT_DIR`） |
+| `--limit N` | 仅播放列表：只处理前 N 条；`0`=整表 |
 | `--mode MODE` | 见下表，默认 `all` |
 | `--end N` | `0`=整片（默认）；`>0` 只处理前 N 秒预览 |
 | `--voice NAME` | 覆盖 `.env` 的 `VOICE` |
@@ -145,9 +151,30 @@ python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --quality bes
 
 # 指定音色
 python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --voice zh-CN-YunyangNeural
+
+# 成品额外拷到 output/，文件名用译好的中文标题
+python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --output ./output
 ```
 
-### 2. 批量列表（`-f`）
+### 2. YouTube 播放列表 / 合集
+
+`--url` 指向 `/playlist?list=...` 时自动展开，按列表顺序逐条跑（和 `-f` 一样：失败记入 `video_failed.txt`，不重试，继续下一条）。
+
+```bash
+# 整表
+python job_run.py --url "https://www.youtube.com/playlist?list=PLAYLIST_ID" --output ./output
+
+# 先试跑前 2 条
+python job_run.py --url "https://www.youtube.com/playlist?list=PLAYLIST_ID" --limit 2 --output ./output
+```
+
+说明：
+
+- `watch?v=ID&list=...` 仍按**单条视频**处理，不会展开合集
+- 工作缓存仍在 `work/<id>/`；给人看的成品在 `--output`
+- 标题翻译失败则用英文标题 + `[id]`；非法文件名字符会替换掉
+
+### 3. 批量列表（`-f`）
 
 准备 `video_list.txt`（每行一个 URL，`#` 开头为注释）：
 
@@ -197,7 +224,7 @@ https://www.youtube.com/watch?v=bbb	TTS incomplete: missing [12, 15]
 python job_run.py --work work/VIDEO_ID --resume
 ```
 
-### 3. 预览（先跑前 N 秒试效果）
+### 4. 预览（先跑前 N 秒试效果）
 
 ```bash
 # 前 3 分钟预览 → out_preview.mp4
@@ -207,7 +234,7 @@ python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --end 180
 python job_run.py --work work/VIDEO_ID --end 60 --mode all
 ```
 
-### 4. 已有本地素材 / 指定 work 目录
+### 5. 已有本地素材 / 指定 work 目录
 
 ```bash
 # work 里已有 source_full.mp4 / 字幕等，从当前状态接着跑
@@ -217,7 +244,7 @@ python job_run.py --work work/VIDEO_ID
 python job_run.py --work /path/to/MyRose/work/VIDEO_ID
 ```
 
-### 5. 查看状态
+### 6. 查看状态
 
 ```bash
 python job_run.py --work work/VIDEO_ID --status
@@ -225,7 +252,7 @@ python job_run.py --work work/VIDEO_ID --status
 python job_run.py --work work/VIDEO_ID --mode status
 ```
 
-### 6. 失败后续跑
+### 7. 失败后续跑
 
 ```bash
 # 推荐：从 job_state 接着跑（跳过已 done）
@@ -238,7 +265,7 @@ python job_run.py --work work/VIDEO_ID
 python job_run.py --work work/VIDEO_ID --no-resume --mode all
 ```
 
-### 7. 按阶段拆开跑
+### 8. 按阶段拆开跑
 
 ```bash
 # 只下载
@@ -264,7 +291,7 @@ python job_run.py --work work/VIDEO_ID --mode tts-mux
 python job_run.py --work work/VIDEO_ID --tts-mux-only
 ```
 
-### 8. 从某一阶段强制重做（`--from`）
+### 9. 从某一阶段强制重做（`--from`）
 
 会把该阶段及**之后**全部标成 pending，再执行。
 
@@ -291,7 +318,7 @@ python job_run.py --work work/VIDEO_ID --end 0 --from prepare_video
 python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --work work/VIDEO_ID --from download
 ```
 
-### 9. 翻译：并发、补译与漏翻自愈
+### 10. 翻译：并发、补译与漏翻自愈
 
 主翻译按 batch **并发**（默认 2）；**全部主翻结束后**再对缺失句做补译。
 
@@ -323,7 +350,7 @@ python job_run.py --work work/VIDEO_ID --from translate
 - 若 `segments.json` 里仍有「中文位 = 英文原文」的回填残留，即使 translate 已 done，再跑也会自动进入补译
 - `TRANSLATE_REFILL_MAX_ROUNDS=0` 可关闭补译
 
-### 10. 手改中文后再出片
+### 11. 手改中文后再出片
 
 ```bash
 # 1) 编辑 work/VIDEO_ID/segments.json 里各段的 "zh"
@@ -335,7 +362,7 @@ python job_run.py --work work/VIDEO_ID --mode tts-mux
 python job_run.py --work work/VIDEO_ID --from tts
 ```
 
-### 11. TTS 相关调参与重跑
+### 12. TTS 相关调参与重跑
 
 ```bash
 # .env 示例（改完无需改命令）
@@ -353,7 +380,7 @@ python job_run.py --work work/VIDEO_ID --voice zh-CN-XiaoxiaoNeural --from tts
 python job_run.py --work work/VIDEO_ID --mode tts --resume
 ```
 
-### 12. narration / mux / 封面
+### 13. narration / mux / 封面
 
 ```bash
 # 旁白时间轴坏了：从 narration 重做
@@ -371,7 +398,7 @@ python job_run.py --work work/VIDEO_ID --from compose
 - 字号略小（16）
 - 约 **32 字**强制换行，优先在标点处断开，减少长句出屏
 
-### 13. 确认成片无误后清理中间文件
+### 14. 确认成片无误后清理中间文件
 
 成片验收通过后，用 `clean` 释放磁盘：work 目录**只保留最终视频**。
 
@@ -404,12 +431,15 @@ python job_run.py --work work/VIDEO_ID --end 180 --mode clean --yes
 - 加 `--yes`：永久删除；清理后 work 目录里通常只剩最终视频
 - **不可恢复**：需要改字幕/重配音时必须重新跑流水线（或重下源片）
 
-### 14. 常见组合速查
+### 15. 常见组合速查
 
 | 场景 | 命令 |
 |---|---|
 | 全新视频整片 | `python job_run.py --url URL` |
-| **批量整片** | `python job_run.py -f video_list.txt` |
+| 导出到指定目录（中文文件名） | `python job_run.py --url URL --output ./output` |
+| **YouTube 合集整表** | `python job_run.py --url PLAYLIST_URL --output ./output` |
+| **合集先试 2 条** | `python job_run.py --url PLAYLIST_URL --limit 2 --output ./output` |
+| **批量整片** | `python job_run.py -f video_list.txt --output ./output` |
 | **批量预览 3 分钟** | `python job_run.py -f video_list.txt --end 180` |
 | 先预览 3 分钟 | `python job_run.py --url URL --end 180` |
 | 看进度 | `python job_run.py --work work/ID --status` |
@@ -469,6 +499,7 @@ STAGE: job-done
 | 路径 | 说明 |
 |---|---|
 | `out.mp4` | 整片成品（可含 1s 封面；`--mode clean --yes` 后通常只剩这个） |
+| `output/<中文标题> [id].mp4` | `--output` / `OUTPUT_DIR` 导出的可读文件名（预览为 `.preview.mp4`） |
 | `out_preview.mp4` | 预览（`--end>0`） |
 | `segments.json` | 分段中枢（可手改 `zh`） |
 | `job_state.json` | 工程状态 |

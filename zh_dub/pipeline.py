@@ -35,10 +35,12 @@ from .logutil import (
     stage_error,
     warn,
 )
+from .export import ensure_titles, publish_output
 from .media import (
     clear_proxy_env,
     download_subs,
     download_video,
+    fetch_video_meta,
     ffprobe_duration,
     ffprobe_fps,
     ffprobe_wh,
@@ -658,14 +660,36 @@ def mux_video(
         )
 
 class Pipeline:
-    def __init__(self, settings: Settings, work: Path, *, end: float = 0.0, voice: str | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        work: Path,
+        *,
+        end: float = 0.0,
+        voice: str | None = None,
+        output_dir: Path | None = None,
+        title_en: str | None = None,
+        video_id: str | None = None,
+    ):
         self.settings = settings
         self.work = work.resolve()
         self.work.mkdir(parents=True, exist_ok=True)
         self.end = float(end or 0.0)
         self.voice = voice or settings.voice
+        self.output_dir = output_dir if output_dir is not None else settings.output_dir
         self.state = JobState(self.work)
-        self.state.update_meta(end=self.end, voice=self.voice, quality=settings.quality)
+        meta_kw: dict[str, Any] = {
+            "end": self.end,
+            "voice": self.voice,
+            "quality": settings.quality,
+        }
+        if video_id:
+            meta_kw["video_id"] = video_id
+        if title_en:
+            meta_kw["title_en"] = title_en
+        if self.output_dir is not None:
+            meta_kw["output_dir"] = str(self.output_dir)
+        self.state.update_meta(**meta_kw)
         self._bootstrap_state_from_artifacts()
 
     def _bootstrap_state_from_artifacts(self) -> None:
@@ -808,7 +832,56 @@ class Pipeline:
             if report["audio_missing"][:10]:
                 warn(f"缺失音频 idx 样例: {report['audio_missing'][:10]}")
 
+    def _capture_source_meta(self, url: str | None = None) -> None:
+        meta = self.state.data.get("meta") or {}
+        title_en = str(meta.get("title_en") or "").strip()
+        video_id = str(meta.get("video_id") or "").strip() or self.work.name
+        if title_en and title_en not in {video_id, "NA", "None"}:
+            ensure_titles(
+                self.settings,
+                self.state,
+                title_en=title_en,
+                video_id=video_id,
+            )
+            return
+        if not url:
+            if video_id and video_id not in {"work"}:
+                url = f"https://www.youtube.com/watch?v={video_id}"
+            else:
+                ensure_titles(self.settings, self.state, video_id=video_id)
+                return
+        try:
+            info_m = fetch_video_meta(self.settings, url)
+        except Exception as e:  # noqa: BLE001
+            warn(f"获取标题失败，稍后用视频 ID 命名: {e}")
+            ensure_titles(self.settings, self.state, video_id=video_id)
+            return
+        self.state.update_meta(
+            video_id=info_m.get("id") or video_id,
+            title_en=info_m.get("title_en") or "",
+            duration=info_m.get("duration") or 0,
+        )
+        ensure_titles(
+            self.settings,
+            self.state,
+            title_en=info_m.get("title_en"),
+            video_id=info_m.get("id") or video_id,
+        )
+
+    def _export_finished(self, src: Path | None) -> Path | None:
+        if src is None or not src.is_file():
+            return src
+        dest = publish_output(
+            self.settings,
+            self.state,
+            src,
+            output_dir=self.output_dir,
+            preview=self.end > 0,
+        )
+        return dest or src
+
     def ensure_media_from_url(self, url: str) -> None:
+        self._capture_source_meta(url)
         if self.state.is_done("download") and (
             (self.work / "source_full.mp4").is_file()
             or (self.work / "source.mp4").is_file()
@@ -1333,6 +1406,10 @@ class Pipeline:
         if url:
             # bind work if empty id folder created by caller
             self.state.update_meta(url=url)
+        if mode not in {"status", "clean"}:
+            self._capture_source_meta(
+                url or self.state.data.get("meta", {}).get("url")
+            )
 
         # download only when url provided and needed
         if url and mode in {"all", "prepare", "download"}:
@@ -1416,6 +1493,14 @@ class Pipeline:
             else:
                 raise SystemExit(f"unknown mode: {mode}")
 
+            if out is None and mode not in {"status", "clean", "download", "prepare", "translate", "tts"}:
+                cand = self._final_out_path()
+                if cand.is_file():
+                    out = cand
+            if out is not None:
+                exported = self._export_finished(out)
+                if exported is not None:
+                    out = exported
             if self.state.next_pending() is None:
                 self.state.data["status"] = "done"
                 self.state.save()

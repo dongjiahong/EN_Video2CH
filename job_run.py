@@ -49,6 +49,7 @@ from zh_dub.logutil import (  # noqa: E402
     warn,
 )
 from zh_dub.pipeline import Pipeline, resolve_work_dir  # noqa: E402
+from zh_dub.sources import fetch_playlist, is_playlist_url, resolve_output_dir  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,7 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="job_run.py",
         description="EN video -> ZH narration (stateful, resumable)",
     )
-    p.add_argument("--url", default=None, help="YouTube URL")
+    p.add_argument(
+        "--url",
+        default=None,
+        help="YouTube video or playlist URL (playlist expands to batch)",
+    )
     p.add_argument("--work", default=None, help="existing work dir")
     p.add_argument(
         "-f",
@@ -71,6 +76,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="where to append failed URLs (default: <list_dir>/video_failed.txt)",
     )
     p.add_argument("--end", type=float, default=0.0, help="0=full (default); >0 preview seconds")
+    p.add_argument(
+        "--output",
+        default=None,
+        help="copy finished mp4 here as '<中文标题> [id].mp4' (overrides OUTPUT_DIR)",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="playlist only: first N items; 0 = entire playlist",
+    )
     p.add_argument("--voice", default=None, help="override VOICE from .env")
     p.add_argument("--quality", default=None, help="720|1080|best override")
     p.add_argument(
@@ -172,6 +188,9 @@ def _run_one(
     resume: bool,
     force_from: str | None,
     clean_yes: bool,
+    output_dir: Path | None = None,
+    title_en: str | None = None,
+    video_id: str | None = None,
 ) -> tuple[int, Path | None, Path | None, str]:
     """
     Run a single job.
@@ -187,6 +206,9 @@ def _run_one(
             work_dir,
             end=end,
             voice=voice,
+            output_dir=output_dir,
+            title_en=title_en,
+            video_id=video_id,
         )
         out = pipe.run(
             url=url,
@@ -207,57 +229,65 @@ def _run_one(
         return 1, work_dir, None, str(e)
 
 
-def _run_batch(
-    settings: Settings,
-    args: argparse.Namespace,
-    *,
-    resume: bool,
-) -> int:
-    list_path = Path(args.url_file).expanduser()
-    if not list_path.is_absolute():
-        list_path = (Path.cwd() / list_path).resolve()
-    else:
-        list_path = list_path.resolve()
-
+def _failed_path_for(args: argparse.Namespace, default_parent: Path) -> Path:
     if args.failed_file:
         failed_path = Path(args.failed_file).expanduser()
         if not failed_path.is_absolute():
             failed_path = (Path.cwd() / failed_path).resolve()
         else:
             failed_path = failed_path.resolve()
-    else:
-        failed_path = list_path.parent / "video_failed.txt"
+        return failed_path
+    return (default_parent / "video_failed.txt").resolve()
 
-    urls = _load_url_list(list_path)
-    if not urls:
-        raise SystemExit(f"URL list is empty: {list_path}")
 
+def _run_url_batch(
+    settings: Settings,
+    args: argparse.Namespace,
+    items: list[dict],
+    *,
+    resume: bool,
+    failed_path: Path,
+    label: str,
+    output_dir: Path | None,
+) -> int:
     mode = args.mode
     if mode in {"status", "clean"}:
-        raise SystemExit(f"batch -f does not support --mode {mode}")
+        raise SystemExit(f"batch does not support --mode {mode}")
 
-    total = len(urls)
+    total = len(items)
     ok_n = 0
     fail_n = 0
     t_all = time.time()
-    stage("batch", f"file={list_path}  urls={total}  failed_log={failed_path}")
-    highlight(f"批量任务  {total} 条  list={list_path.name}")
+    stage("batch", f"{label}  urls={total}  failed_log={failed_path}")
+    highlight(f"批量任务  {total} 条  {label}")
+    if output_dir is not None:
+        keyval("output_dir", output_dir)
     keyval("failed_log", failed_path)
 
-    for i, url in enumerate(urls, start=1):
+    for i, item in enumerate(items, start=1):
+        url = item["url"]
+        title = item.get("title_en") or ""
         stage("batch-item", f"{i}/{total}")
         highlight(f"[{i}/{total}] {url}")
+        if title:
+            info(f"EN  {title}")
         t0 = time.time()
+        work = None
+        if item.get("id"):
+            work = str(settings.workdir / str(item["id"]))
         code, work_dir, out, err = _run_one(
             settings,
             url=url,
-            work=None,
+            work=work,
             mode=mode,
             end=args.end,
             voice=args.voice,
             resume=resume,
             force_from=args.force_from,
             clean_yes=False,
+            output_dir=output_dir,
+            title_en=title or None,
+            video_id=item.get("id"),
         )
         elapsed = time.time() - t0
         if code == 130:
@@ -266,7 +296,6 @@ def _run_batch(
             return 130
         if code != 0:
             fail_n += 1
-            # no retry: record and continue to next URL
             _append_failed(failed_path, url, err or "failed")
             warn(f"[{i}/{total}] 失败已记录  ({elapsed:.1f}s)  -> {failed_path.name}")
             continue
@@ -289,6 +318,59 @@ def _run_batch(
         info(f"失败 URL 已写入: {failed_path}")
         return 1
     return 0
+
+
+def _run_file_batch(
+    settings: Settings,
+    args: argparse.Namespace,
+    *,
+    resume: bool,
+    output_dir: Path | None,
+) -> int:
+    list_path = Path(args.url_file).expanduser()
+    if not list_path.is_absolute():
+        list_path = (Path.cwd() / list_path).resolve()
+    else:
+        list_path = list_path.resolve()
+
+    urls = _load_url_list(list_path)
+    if not urls:
+        raise SystemExit(f"URL list is empty: {list_path}")
+    items = [{"url": u, "id": None, "title_en": ""} for u in urls]
+    failed_path = _failed_path_for(args, list_path.parent)
+    return _run_url_batch(
+        settings,
+        args,
+        items,
+        resume=resume,
+        failed_path=failed_path,
+        label=f"file={list_path}",
+        output_dir=output_dir,
+    )
+
+
+def _run_playlist_batch(
+    settings: Settings,
+    args: argparse.Namespace,
+    *,
+    resume: bool,
+    output_dir: Path | None,
+) -> int:
+    stage("playlist", args.url)
+    data = fetch_playlist(settings, args.url, limit=int(args.limit or 0))
+    items = data["items"]
+    highlight(f"播放列表  {data.get('title') or ''}  {len(items)} 条")
+    failed_path = _failed_path_for(args, Path.cwd())
+    stage_done("playlist", f"items={len(items)}")
+    return _run_url_batch(
+        settings,
+        args,
+        items,
+        resume=resume,
+        failed_path=failed_path,
+        label=f"playlist={data.get('title') or args.url}",
+        output_dir=output_dir,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -322,6 +404,9 @@ def main(argv: list[str] | None = None) -> int:
     keyval("voice", args.voice or settings.voice)
     keyval("quality", settings.quality)
     keyval("mode", args.mode)
+    output_dir = resolve_output_dir(settings, args.output)
+    if output_dir is not None:
+        keyval("output_dir", output_dir)
     detail(
         f"tools yt-dlp={settings.yt_dlp}  ffmpeg={settings.ffmpeg}  "
         f"edge-tts={settings.edge_tts}"
@@ -332,7 +417,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.url_file:
         if args.url or args.work:
             warn("批量 -f 模式下忽略 --url / --work")
-        return _run_batch(settings, args, resume=resume)
+        return _run_file_batch(
+            settings, args, resume=resume, output_dir=output_dir
+        )
+
+    if args.url and is_playlist_url(args.url):
+        if args.work:
+            warn("播放列表模式下忽略 --work")
+        if args.mode in {"status", "clean"}:
+            raise SystemExit("playlist URL does not support --mode status/clean")
+        return _run_playlist_batch(
+            settings, args, resume=resume, output_dir=output_dir
+        )
 
     if not args.url and not args.work:
         raise SystemExit("Need --url, --work, or -f url_list.txt")
@@ -347,6 +443,7 @@ def main(argv: list[str] | None = None) -> int:
         resume=resume,
         force_from=args.force_from,
         clean_yes=bool(args.yes),
+        output_dir=output_dir,
     )
     if code != 0:
         return code

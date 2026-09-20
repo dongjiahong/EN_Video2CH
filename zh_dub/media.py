@@ -7,7 +7,7 @@ import wave
 from pathlib import Path
 
 from .config import Settings
-from .logutil import detail, highlight, info, ok, skip
+from .logutil import detail, highlight, info, ok, skip, warn
 
 
 def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -217,6 +217,45 @@ def resolve_video_id(settings: Settings, url: str) -> str:
     if not vid:
         raise RuntimeError("failed to resolve youtube id")
     return vid
+
+
+def fetch_video_meta(settings: Settings, url: str) -> dict:
+    """Resolve id/title/duration without downloading media."""
+    env = with_proxy_env(settings.proxy)
+    cp = subprocess.run(
+        [
+            settings.yt_dlp,
+            "--print",
+            "%(id)s\t%(title)s\t%(duration)s",
+            "--skip-download",
+            url,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    line = ""
+    for raw in (cp.stdout or "").splitlines():
+        if raw.strip():
+            line = raw.strip()
+            break
+    parts = line.split("\t")
+    vid = (parts[0] if parts else "").strip()
+    title = (parts[1] if len(parts) > 1 else "").strip()
+    dur_raw = (parts[2] if len(parts) > 2 else "").strip()
+    duration = 0
+    try:
+        if dur_raw and dur_raw not in {"NA", "None"}:
+            duration = int(float(dur_raw))
+    except ValueError:
+        duration = 0
+    if not vid:
+        raise RuntimeError("failed to resolve youtube id")
+    if not title or title in {"NA", "None"}:
+        title = vid
+        warn("yt-dlp 未返回标题，稍后文件名将回退到视频 ID")
+    return {"id": vid, "title_en": title, "duration": duration}
 
 
 def prepare_source_video(settings: Settings, work: Path, end: float) -> dict:
