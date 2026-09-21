@@ -1039,6 +1039,7 @@ class Pipeline:
                 self.state,
                 [s.en for s in segs],
                 force=force,
+                title_en=str((self.state.data.get("meta") or {}).get("title_en") or ""),
             )
             for s, zh in zip(segs, zhs):
                 s.zh = zh

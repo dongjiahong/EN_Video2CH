@@ -8,9 +8,8 @@ import shutil
 from pathlib import Path
 
 from .config import Settings
-from .logutil import detail, highlight, info, skip, warn
+from .logutil import info, skip, warn
 from .state import JobState
-from .translate import translate_title
 
 UNSAFE_FS = re.compile(r'[\\/:*?"<>|\n\r\t]')
 PLACEHOLDER_TITLES = {"", "NA", "None", "null"}
@@ -106,7 +105,8 @@ def ensure_titles(
     title_en: str | None = None,
     video_id: str | None = None,
 ) -> None:
-    """Fill title_en / title_zh on job meta. Title translate failure is non-fatal."""
+    """Store English title on job meta. Chinese title is filled during body translate."""
+    del settings
     meta = state.data.setdefault("meta", {})
     vid = (video_id or meta.get("video_id") or state.work.name or "").strip()
     if vid and not meta.get("video_id"):
@@ -117,26 +117,7 @@ def ensure_titles(
         en = ""
     if en:
         meta["title_en"] = en
-
-    zh = str(meta.get("title_zh") or "").strip()
-    if zh and not looks_like_video_id(zh, vid):
-        state.save()
-        return
-
-    source = str(meta.get("title_en") or "").strip()
-    if looks_like_video_id(source, vid):
+        info(f"标题  EN: {en}")
+    elif looks_like_video_id(str(meta.get("title_en") or ""), vid):
         warn("无可用英文标题，导出文件名将使用视频 ID")
-        state.save()
-        return
-
-    try:
-        zh = translate_title(settings, source)
-    except Exception as e:  # noqa: BLE001
-        warn(f"标题翻译失败，导出用英文标题: {e}")
-        zh = source
-    if looks_like_video_id(zh, vid):
-        zh = source
-    meta["title_zh"] = zh
-    info(f"标题  EN: {source}")
-    detail(f"标题  ZH: {zh}")
     state.save()
