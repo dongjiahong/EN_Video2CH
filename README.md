@@ -161,8 +161,9 @@ python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --output ./ou
 `--url` 指向 `/playlist?list=...` 时自动展开，按列表顺序逐条跑（和 `-f` 一样：失败记入 `video_failed.txt`，不重试，继续下一条）。
 
 ```bash
-# 整表
+# 整表   如果停了可以重复执行这个命令
 python job_run.py --url "https://www.youtube.com/playlist?list=PLAYLIST_ID" --output ./output
+
 
 # 先试跑前 2 条
 python job_run.py --url "https://www.youtube.com/playlist?list=PLAYLIST_ID" --limit 2 --output ./output
