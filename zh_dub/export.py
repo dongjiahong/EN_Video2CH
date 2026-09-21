@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 
 from .config import Settings
-from .logutil import info, skip, warn
+from .logutil import highlight, info, skip, warn
 from .state import JobState
 
 UNSAFE_FS = re.compile(r'[\\/:*?"<>|\n\r\t]')
