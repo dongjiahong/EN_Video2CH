@@ -12,10 +12,10 @@ from typing import Any
 
 from .captions import (
     Segment,
+    build_segments,
     drop_fillers,
     load_cues,
     load_segments,
-    merge_cues,
     resolve_subtitle,
     save_segments,
     write_srt,
@@ -83,10 +83,8 @@ def compress_zh(text: str) -> list[str]:
 
 
 def _segment_slot(seg: Segment, next_start: float | None) -> float:
-    slot = seg.slot
-    if next_start is not None and next_start > seg.end:
-        slot += min(0.35, max(0.0, next_start - seg.end))
-    return slot
+    # Keep the English breath after this clip; do not borrow the next onset.
+    return seg.slot
 
 
 def _needed_rate_pct(dur: float, slot: float, max_rate: int) -> int:
@@ -964,11 +962,10 @@ class Pipeline:
         self.state.set_running("merge")
         try:
             stage("merge")
-            if cues is None:
-                raw = self.state.read_json("cues.json") or []
-                cues = [(c["start"], c["end"], c["text"]) for c in raw]
-            info(f"输入 cues={len(cues)}，开始断句合并")
-            segs = merge_cues(cues)
+            sub = resolve_subtitle(self.work)
+            t1 = None if self.end <= 0 else float(self.end)
+            info(f"输入字幕 {sub.name}，按词级停顿打包")
+            segs = build_segments(sub, t0=0.0, t1=t1)
             self.state.write_json("segments_en.json", [s.__dict__ for s in segs])
             # also keep work/segments.json skeleton if absent
             if not (self.work / "segments.json").is_file():

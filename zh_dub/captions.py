@@ -171,6 +171,387 @@ def load_cues(path: Path) -> list[tuple[float, float, str]]:
     return parse_vtt(path)
 
 
+_WORD_TIME_RE = re.compile(r"<(\d{2}:\d{2}:\d{2}[.,]\d{3})>")
+_FILLER_WORD_RE = re.compile(r"(?i)^(um+|uh+|erm+|hmm+)$")
+_TOKEN_KEY_RE = re.compile(r"[^a-z0-9']")
+
+# Do not end a pack on these (would orphan the next word).
+_END_FUNCTION_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "from",
+        "into",
+        "through",
+        "onto",
+        "over",
+        "under",
+        "between",
+        "by",
+        "via",
+        "as",
+        "if",
+        "and",
+        "or",
+        "but",
+        "nor",
+        "every",
+        "each",
+        "any",
+        "all",
+        "such",
+        "no",
+        "not",
+        "my",
+        "our",
+        "your",
+        "their",
+        "his",
+        "her",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "will",
+        "would",
+        "could",
+        "should",
+        "can",
+        "may",
+        "might",
+        "must",
+        "do",
+        "does",
+        "did",
+        "have",
+        "has",
+        "had",
+        "going",
+        "trying",
+        "looking",
+        "want",
+        "wants",
+        "need",
+        "needs",
+        "i'm",
+        "we're",
+        "you're",
+        "they're",
+        "he's",
+        "she's",
+        "it's",
+        "that's",
+        "there's",
+        "who's",
+        "what's",
+        "don't",
+        "doesn't",
+        "didn't",
+        "won't",
+        "can't",
+        "couldn't",
+        "shouldn't",
+        "isn't",
+        "aren't",
+        "gonna",
+        "wanna",
+        "gotta",
+        "kinda",
+        "sorta",
+        "very",
+        "really",
+        "actually",
+        "quite",
+        "pretty",
+        "too",
+        "more",
+        "most",
+        "less",
+        "just",
+        "still",
+        "even",
+        "only",
+        "almost",
+        "already",
+        "also",
+        "basically",
+        "probably",
+        "maybe",
+        "same",
+        "other",
+        "another",
+        "who",
+        "whom",
+        "whose",
+        "which",
+        "what",
+        "when",
+        "where",
+        "why",
+        "how",
+        "because",
+        "while",
+        "after",
+        "before",
+        "until",
+        "unless",
+        "whether",
+        "though",
+        "although",
+    }
+)
+# Do not start a pack on these (they belong to the previous noun/verb).
+_START_FUNCTION_WORDS = frozenset(
+    {
+        "of",
+        "to",
+        "for",
+        "from",
+        "with",
+        "into",
+        "through",
+        "onto",
+        "the",
+        "a",
+        "an",
+    }
+)
+
+
+def _token_key(word: str) -> str:
+    return _TOKEN_KEY_RE.sub("", (word or "").lower())
+
+
+def _is_mid_word_cut(prev: str, nxt: str) -> bool:
+    p_parts = prev.split()
+    n_parts = nxt.split()
+    p = _token_key(p_parts[-1] if p_parts else prev)
+    n = _token_key(n_parts[0] if n_parts else nxt)
+    if not p or not n:
+        return True
+    return p in _END_FUNCTION_WORDS or n in _START_FUNCTION_WORDS
+
+
+def parse_vtt_words(path: Path) -> list[tuple[float, str]]:
+    """Extract (start, word) from YouTube auto-caption word timestamps."""
+    text = path.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n")
+    blocks = re.split(r"\n\s*\n", text)
+    words: list[tuple[float, str]] = []
+
+    def push(t: float, raw: str) -> None:
+        cleaned = clean_caption_text(raw)
+        if not cleaned:
+            return
+        token = cleaned.split()[-1].strip(".,;:!?\"'“”")
+        if not token or _FILLER_WORD_RE.match(token):
+            return
+        if words:
+            last_t, last_w = words[-1]
+            if t < last_t - 0.02:
+                return
+            if abs(t - last_t) < 0.08 and token.lower() == last_w.lower():
+                return
+        words.append((t, token))
+
+    for block in blocks:
+        m = TIME_RE.search(block)
+        if not m:
+            continue
+        cue_start = ts_to_seconds(m.group(1))
+        timed_line = None
+        for line in block[m.end() :].splitlines():
+            line = line.strip()
+            if not line or line.isdigit() or line.startswith("NOTE"):
+                continue
+            if _WORD_TIME_RE.search(line):
+                timed_line = line
+                break
+        if not timed_line:
+            continue
+        parts = re.split(r"(<\d{2}:\d{2}:\d{2}[.,]\d{3}>)", timed_line)
+        prefix = clean_caption_text(parts[0])
+        if prefix:
+            push(cue_start, prefix.split()[-1])
+        i = 1
+        while i < len(parts):
+            ts_raw = parts[i]
+            nxt = parts[i + 1] if i + 1 < len(parts) else ""
+            i += 2
+            tm = _WORD_TIME_RE.search(ts_raw)
+            if not tm:
+                continue
+            w = clean_caption_text(nxt)
+            if w:
+                push(ts_to_seconds(tm.group(1)), w.split()[0])
+    return words
+
+
+def _words_to_atoms(words: list[tuple[float, str]]) -> list[tuple[float, float, str]]:
+    """Word span occupies only the spoken portion; leftover onset is the breath."""
+    out: list[tuple[float, float, str]] = []
+    for i, (st, w) in enumerate(words):
+        nxt = words[i + 1][0] if i + 1 < len(words) else st + 0.28
+        onset = max(0.02, nxt - st)
+        spoken = min(0.28, max(0.10, onset * 0.55))
+        en = min(st + spoken, nxt)
+        if en <= st:
+            en = min(nxt, st + 0.05)
+        out.append((st, en, w))
+    return out
+
+
+def _atom_pause(
+    prev: tuple[float, float, str], nxt: tuple[float, float, str]
+) -> float:
+    """Word atoms use inter-onset; multi-word cues use the timeline gap."""
+    gap = nxt[0] - prev[1]
+    onset = nxt[0] - prev[0]
+    if len(prev[2].split()) <= 1:
+        return max(0.0, onset)
+    return max(0.0, gap)
+
+
+def _window_units(
+    units: list[tuple[float, float, str]], t0: float, t1: float
+) -> list[tuple[float, float, str]]:
+    out: list[tuple[float, float, str]] = []
+    for s, e, t in units:
+        if e <= t0 or s >= t1:
+            continue
+        ns, ne = max(s, t0), min(e, t1)
+        if ne > ns:
+            out.append((ns, ne, t))
+    return out
+
+
+def pack_breath_segments(
+    atoms: list[tuple[float, float, str]],
+    *,
+    target_len: float = 3.5,
+    max_len: float = 5.5,
+    min_len: float = 1.6,
+    max_chars: int = 110,
+    pause: float = 0.48,
+    strong_pause: float = 0.72,
+    min_words: int = 3,
+) -> list[Segment]:
+    """Pack word/cue atoms into speakable segments at natural breaths."""
+    if not atoms:
+        return []
+
+    n = len(atoms)
+    raw: list[tuple[float, float, str]] = []
+    i = 0
+
+    def piece(a: int, b: int) -> str:
+        return _normalize_cue_text(" ".join(atoms[k][2] for k in range(a, b)))
+
+    while i < n:
+        j = i + 1
+        last_good: int | None = None
+        while j < n:
+            prev = atoms[j - 1]
+            nxt = atoms[j]
+            mid = _is_mid_word_cut(prev[2], nxt[2])
+            cur_dur = prev[1] - atoms[i][0]
+            cand_dur = nxt[1] - atoms[i][0]
+            cand_text = piece(i, j + 1)
+            pause_s = _atom_pause(prev, nxt)
+            if not mid and cur_dur >= min_len:
+                last_good = j
+            cut = False
+            if not mid and cur_dur >= min_len:
+                if pause_s >= strong_pause:
+                    cut = True
+                elif pause_s >= pause and cur_dur >= target_len:
+                    cut = True
+                elif cur_dur >= target_len and pause_s >= pause * 0.75:
+                    cut = True
+            if not mid and cur_dur >= min_len and (
+                cand_dur > max_len or len(cand_text) > max_chars
+            ):
+                cut = True
+            if cut:
+                break
+            j += 1
+            over_dur = atoms[j - 1][1] - atoms[i][0]
+            over_txt = piece(i, j)
+            if over_dur > max_len * 1.15 or len(over_txt) > int(max_chars * 1.15):
+                if last_good is not None and last_good > i + 1:
+                    j = last_good
+                break
+        if j <= i:
+            j = min(n, i + 1)
+        text = piece(i, j)
+        if text:
+            raw.append((atoms[i][0], atoms[j - 1][1], text))
+        i = j
+
+    if len(raw) >= 2:
+        fixed: list[tuple[float, float, str]] = [raw[0]]
+        for ns, ne, nt in raw[1:]:
+            ps, pe, pt = fixed[-1]
+            gap = ns - pe
+            cand = _normalize_cue_text(f"{pt} {nt}")
+            cand_dur = ne - ps
+            prev_micro = (pe - ps) < min_len or len(pt.split()) < min_words
+            nxt_micro = (ne - ns) < min_len or len(nt.split()) < min_words
+            fits = cand_dur <= max_len * 1.15 and len(cand) <= int(max_chars * 1.15)
+            mid = _is_mid_word_cut(pt, nt)
+            if mid and fits and gap < strong_pause:
+                fixed[-1] = (ps, ne, cand)
+            elif (prev_micro or nxt_micro) and fits and gap < pause:
+                fixed[-1] = (ps, ne, cand)
+            else:
+                fixed.append((ns, ne, nt))
+        raw = fixed
+
+    return [
+        Segment(idx=i, start=st, end=en, en=tx) for i, (st, en, tx) in enumerate(raw)
+    ]
+
+
+def build_segments(
+    path: Path,
+    *,
+    t0: float = 0.0,
+    t1: float | None = None,
+) -> list[Segment]:
+    """Build TTS segments from a subtitle file. Prefer word-level breaths."""
+    end = 1e12 if t1 is None or t1 <= 0 else t1
+    if path.suffix.lower() != ".srt":
+        words = parse_vtt_words(path)
+        if len(words) >= 12:
+            atoms = _window_units(_words_to_atoms(words), t0, end)
+            if atoms:
+                return pack_breath_segments(atoms)
+    cues = _window_units(load_cues(path), t0, end)
+    return merge_cues(
+        cues,
+        target_len=3.5,
+        max_len=5.5,
+        max_chars=110,
+        min_seg_dur=1.2,
+        min_seg_words=3,
+    )
+
+
 # Match a finished sentence (may appear mid-cue in auto captions).
 _SENTENCE_SPLIT_RE = re.compile(
     r'(?<=[.!?…])(?:["\'”’)\]]+)?(?=\s+|$)'
@@ -191,7 +572,8 @@ _DANGLING_END_RE = re.compile(
     r"let's|gonna|wanna|gotta|kinda|sorta|able|still|also|even|only|"
     r"really|actually|basically|probably|maybe|something|anything|"
     r"everything|nothing|someone|anyone|everyone|because|while|after|"
-    r"before|until|unless|whether|though|although|through"
+    r"before|until|unless|whether|though|although|through|"
+    r"every|each|any|all|such"
     r")\s*$"
 )
 
@@ -392,19 +774,19 @@ def _allocate_times(
 def merge_cues(
     cues: list[tuple[float, float, str]],
     max_gap: float = 0.75,
-    target_len: float = 5.0,
-    max_len: float = 8.5,
-    max_chars: int = 140,
-    min_seg_dur: float = 1.4,
-    min_seg_words: int = 4,
+    target_len: float = 3.5,
+    max_len: float = 5.5,
+    max_chars: int = 110,
+    min_seg_dur: float = 1.2,
+    min_seg_words: int = 3,
 ) -> list[Segment]:
     """
-    Merge auto-caption crumbs into speakable segments.
+    Fallback packer when word timestamps are missing.
 
     1) Chain tight cues into runs (pause = hard cut).
     2) Split each run on real sentence punctuation (handles mid-cue periods).
     3) Re-glue only unfinished fragments.
-    4) Pack whole sentences into ~target_len segments for TTS.
+    4) Pack into ~3.5s breath-sized segments for TTS.
     """
     if not cues:
         return []
