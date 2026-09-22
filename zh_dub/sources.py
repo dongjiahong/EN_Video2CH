@@ -40,10 +40,47 @@ def watch_url(video_id: str) -> str:
     return WATCH_TMPL.format(id=video_id)
 
 
+def parse_limit(raw: str | None) -> tuple[int, int]:
+    """Parse SQL-style LIMIT into (offset, count).
+
+    count<=0 means unlimited (remaining items after offset).
+      "" / None / "0" -> (0, 0)   whole list
+      "20"            -> (0, 20)  first 20
+      "20,40"         -> (20, 40) skip 20, take 40
+    """
+    s = (raw or "").strip()
+    if not s:
+        return 0, 0
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) == 1:
+        return 0, _nonneg_int(parts[0], "limit")
+    if len(parts) == 2:
+        offset = _nonneg_int(parts[0], "limit offset")
+        count = _nonneg_int(parts[1], "limit count")
+        if count <= 0:
+            raise ValueError("LIMIT OFFSET,COUNT 的 COUNT 必须 > 0（例如 20,40）")
+        return offset, count
+    raise ValueError("LIMIT 格式: N 或 OFFSET,COUNT（例如 20 或 20,40）")
+
+
+def _nonneg_int(raw: str, label: str) -> int:
+    if not raw or not raw.isdigit():
+        raise ValueError(f"{label} 必须是非负整数，收到: {raw!r}")
+    return int(raw)
+
+
+def apply_limit(items: list, offset: int, count: int) -> list:
+    """Slice like SQL LIMIT. count<=0 means all remaining after offset."""
+    if offset <= 0 and count <= 0:
+        return items
+    end = None if count <= 0 else offset + count
+    return items[offset:end]
+
+
 def fetch_playlist(
-    settings: Settings, url: str, *, limit: int = 0
+    settings: Settings, url: str, *, offset: int = 0, count: int = 0
 ) -> dict[str, Any]:
-    """Expand a playlist into watch URLs. limit<=0 means the whole list."""
+    """Expand a playlist into watch URLs. count<=0 means the whole list."""
     env = with_proxy_env(settings.proxy)
     cmd = [
         settings.yt_dlp,
@@ -51,8 +88,10 @@ def fetch_playlist(
         "--print",
         "%(playlist_title)s\t%(playlist_index)s\t%(id)s\t%(title)s\t%(duration)s",
     ]
-    if limit > 0:
-        cmd += ["--playlist-end", str(limit)]
+    if offset > 0:
+        cmd += ["--playlist-start", str(offset + 1)]
+    if count > 0:
+        cmd += ["--playlist-end", str(offset + count)]
     cmd.append(url)
     detail("yt-dlp --flat-playlist ...")
     cp = subprocess.run(
@@ -103,13 +142,16 @@ def fetch_playlist(
                 "url": watch_url(vid),
             }
         )
-        if limit > 0 and len(items) >= limit:
+        if count > 0 and len(items) >= count:
             break
 
     if not items:
         raise RuntimeError(f"playlist is empty or could not be expanded: {url}")
 
-    info(f"播放列表  {playlist_title or '(无标题)'}  共 {len(items)} 条")
+    window = ""
+    if offset > 0 or count > 0:
+        window = f"  offset={offset} count={count or 'all'}"
+    info(f"播放列表  {playlist_title or '(无标题)'}  本批 {len(items)} 条{window}")
     highlight(f"将逐条处理 {len(items)} 个视频")
     return {"title": playlist_title, "items": items, "url": url}
 

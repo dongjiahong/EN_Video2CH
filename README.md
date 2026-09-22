@@ -102,7 +102,7 @@ python job_run.py --help
 | `-f` / `--file LIST` | 批量 URL 列表（每行一个）；失败写入同目录 `video_failed.txt`，**不重试** |
 | `--failed-file PATH` | 自定义失败列表路径（默认 `<list_dir>/video_failed.txt`） |
 | `--output DIR` | 把成品复制/硬链到该目录，文件名 `<中文标题> [id].mp4`（覆盖 `.env` 的 `OUTPUT_DIR`） |
-| `--limit N` | 仅播放列表：只处理前 N 条；`0`=整表 |
+| `--limit N` 或 `--limit OFFSET,COUNT` | 播放列表 / `-f` 批量窗口，SQL 风格：`N`=前 N 条；`OFFSET,COUNT`=跳过 OFFSET 再取 COUNT；`0`=全部 |
 | `--mode MODE` | 见下表，默认 `all` |
 | `--end N` | `0`=整片（默认）；`>0` 只处理前 N 秒预览 |
 | `--voice NAME` | 覆盖 `.env` 的 `VOICE` |
@@ -167,6 +167,9 @@ python job_run.py --url "https://www.youtube.com/playlist?list=PLAYLIST_ID" --ou
 
 # 先试跑前 2 条
 python job_run.py --url "https://www.youtube.com/playlist?list=PLAYLIST_ID" --limit 2 --output ./output
+
+# 跳过前 20 条，再跑 40 条（SQL: LIMIT 20,40）
+python job_run.py --url "https://www.youtube.com/playlist?list=PLAYLIST_ID" --limit 20,40 --output ./output
 ```
 
 说明：
@@ -174,6 +177,7 @@ python job_run.py --url "https://www.youtube.com/playlist?list=PLAYLIST_ID" --li
 - `watch?v=ID&list=...` 仍按**单条视频**处理，不会展开合集
 - 工作缓存仍在 `work/<id>/`；给人看的成品在 `--output`
 - 标题翻译失败则用英文标题 + `[id]`；非法文件名字符会替换掉
+- `--limit` 是 MySQL 风格窗口：`20` = 第 1～20 条；`20,40` = 跳过前 20 条再取 40 条（第 21～60 条）。已处理过的 `work/<id>/` 会按状态续跑，不会重做完整流程
 
 ### 3. 批量列表（`-f`）
 
@@ -196,6 +200,10 @@ python job_run.py -f video_list.txt --failed-file ./video_failed.txt
 # 批量预览 / 画质 / 模式
 python job_run.py -f video_list.txt --end 180 --quality 720
 python job_run.py -f video_list.txt --mode prepare
+
+# 大列表分批：先跑前 20 条，再跳过 20 条跑下一批 40 条
+python job_run.py -f video_list.txt --limit 20
+python job_run.py -f video_list.txt --limit 20,40
 ```
 
 行为说明：
@@ -211,6 +219,7 @@ python job_run.py -f video_list.txt --mode prepare
 | 退出码 | 有任意失败 → `1`；全部成功 → `0`；用户中断 → `130` |
 | 不支持 | 批量下不可用 `--mode status` / `--mode clean` |
 | 忽略 | 批量模式下若同时写了 `--url` / `--work` 会被忽略 |
+| `--limit` | 可选窗口：`20` 前 20 条；`20,40` 跳过 20 再取 40；不写或 `0` 为整表 |
 
 失败文件示例：
 
@@ -440,6 +449,7 @@ python job_run.py --work work/VIDEO_ID --end 180 --mode clean --yes
 | 导出到指定目录（中文文件名） | `python job_run.py --url URL --output ./output` |
 | **YouTube 合集整表** | `python job_run.py --url PLAYLIST_URL --output ./output` |
 | **合集先试 2 条** | `python job_run.py --url PLAYLIST_URL --limit 2 --output ./output` |
+| **合集/列表分批** | `python job_run.py --url PLAYLIST_URL --limit 20,40` 或 `-f list.txt --limit 20,40` |
 | **批量整片** | `python job_run.py -f video_list.txt --output ./output` |
 | **批量预览 3 分钟** | `python job_run.py -f video_list.txt --end 180` |
 | 先预览 3 分钟 | `python job_run.py --url URL --end 180` |

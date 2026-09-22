@@ -49,7 +49,13 @@ from zh_dub.logutil import (  # noqa: E402
     warn,
 )
 from zh_dub.pipeline import Pipeline, resolve_work_dir  # noqa: E402
-from zh_dub.sources import fetch_playlist, is_playlist_url, resolve_output_dir  # noqa: E402
+from zh_dub.sources import (
+    apply_limit,
+    fetch_playlist,
+    is_playlist_url,
+    parse_limit,
+    resolve_output_dir,
+)  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,9 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--limit",
-        type=int,
-        default=0,
-        help="playlist only: first N items; 0 = entire playlist",
+        default="0",
+        metavar="N | OFFSET,COUNT",
+        help="SQL-style window: N = first N; OFFSET,COUNT = skip OFFSET then take COUNT; 0 = all",
     )
     p.add_argument("--voice", default=None, help="override VOICE from .env")
     p.add_argument("--quality", default=None, help="720|1080|best override")
@@ -229,6 +235,13 @@ def _run_one(
         return 1, work_dir, None, str(e)
 
 
+def _limit_from_args(args: argparse.Namespace) -> tuple[int, int]:
+    try:
+        return parse_limit(args.limit)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
+
+
 def _failed_path_for(args: argparse.Namespace, default_parent: Path) -> Path:
     if args.failed_file:
         failed_path = Path(args.failed_file).expanduser()
@@ -337,11 +350,19 @@ def _run_file_batch(
     if not urls:
         raise SystemExit(f"URL list is empty: {list_path}")
     items = [{"url": u, "id": None, "title_en": ""} for u in urls]
+    offset, count = _limit_from_args(args)
+    sliced = apply_limit(items, offset, count)
+    if not sliced:
+        raise SystemExit(
+            f"URL list has {len(items)} items; --limit offset={offset} count={count} selected none"
+        )
+    if offset or count:
+        info(f"列表窗口  全表 {len(items)} 条  本批 {len(sliced)} 条  offset={offset} count={count or 'all'}")
     failed_path = _failed_path_for(args, list_path.parent)
     return _run_url_batch(
         settings,
         args,
-        items,
+        sliced,
         resume=resume,
         failed_path=failed_path,
         label=f"file={list_path}",
@@ -357,7 +378,8 @@ def _run_playlist_batch(
     output_dir: Path | None,
 ) -> int:
     stage("playlist", args.url)
-    data = fetch_playlist(settings, args.url, limit=int(args.limit or 0))
+    offset, count = _limit_from_args(args)
+    data = fetch_playlist(settings, args.url, offset=offset, count=count)
     items = data["items"]
     highlight(f"播放列表  {data.get('title') or ''}  {len(items)} 条")
     failed_path = _failed_path_for(args, Path.cwd())
