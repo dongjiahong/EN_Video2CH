@@ -17,7 +17,8 @@ MyRose/
     state.py           # job_state.json 状态机
     pipeline.py        # 阶段编排 + 最终合成
     translate.py       # 翻译（并发 batch + 多轮补译）
-    captions.py        # 字幕解析 / ASS 换行
+    asr.py             # parakeet-mlx 本地转录 → asr.srt
+    captions.py        # SRT 解析 / 断句 / ASS 换行
     media.py           # 下载 / ffmpeg / tts
     sources.py         # 播放列表展开 / 输出目录
     export.py          # 中文标题命名并导出成品
@@ -42,6 +43,10 @@ python -m pip install -r requirements.txt
 # 系统还需: yt-dlp, ffmpeg(libass), ffprobe
 #macos brew install yt-dlp ffmpeg-full
 # edge-tts 装在该 conda 环境里
+
+# 本地 ASR 字幕（Apple Silicon；可选但推荐）：
+pip install parakeet-mlx
+# 首次使用时自动从 HuggingFace 下载 mlx-community/parakeet-tdt-0.6b-v3
 ```
 
 `.env` 里建议固定：
@@ -74,6 +79,13 @@ cp .env.example .env
 | `TRANSLATE_REFILL_MAX_ROUNDS` | 漏翻补译轮数上限（某轮零进展提前停） | `2` |
 | `TTS_CONCURRENCY` | TTS 并发数（edge 易限流，可调 2～16） | `2` |
 | `TTS_MAX_RATE` | TTS 最大加速百分比 | `30` |
+| `SUBTITLE_SOURCE` | 字幕来源：`asr`（本地转录，默认）/ `auto`（asr.srt 优先，缺则用已有 source.srt） | `asr` |
+| `PARAKEET_MODEL` | parakeet-mlx 模型名（HF 仓库） | `mlx-community/parakeet-tdt-0.6b-v3` |
+| `PARAKEET_SILENCE_GAP` | 句间静音分割阈值（秒） | `2.0` |
+| `PARAKEET_CHUNK_DURATION` | 长音频分块转录秒数（`0` 关闭分块） | `120` |
+| `PARAKEET_OVERLAP_DURATION` | 分块重叠秒数 | `15` |
+| `PARAKEET_DECODING` | 解码方式 `greedy`/`beam` | `greedy` |
+| `PARAKEET_BEAM_SIZE` | beam 解码束宽 | `5` |
 | `COVER_IMAGE` | 最终成片片头封面图（1 秒；相对项目根或绝对路径；不配则不加） | 空 |
 | `PYTHON`/`YT_DLP`/`FFMPEG`/`FFPROBE`/`EDGE_TTS` | 可选绝对路径 | 自动探测 |
 | `MODELSCOPE_BASE_URL` | 翻译 API base | ModelScope 默认 |
@@ -119,10 +131,10 @@ python job_run.py --help
 
 | mode | 做什么 |
 |---|---|
-| `all` | 全流程：下载→准备→翻译→TTS→旁白时间轴→合成 |
-| `download` | 只下载视频+字幕，并 `prepare_video` |
-| `prepare` | 到翻译为止（prepare_video + cues + merge + translate） |
-| `translate` | 只翻译（缺 merge 时会先补 cues/merge） |
+| `all` | 全流程：下载→准备→转录→翻译→TTS→旁白时间轴→合成 |
+| `download` | 只下载视频，并 `prepare_video` |
+| `prepare` | 到翻译为止（prepare_video + transcribe + cues + merge + translate） |
+| `translate` | 只翻译（缺 asr.srt/merge 时会先补 transcribe/cues/merge） |
 | `tts` | 只 TTS（需已有 `segments.json`） |
 | `mux` | 旁白时间轴 + 成片（需已有 TTS 音频） |
 | `tts-mux` | TTS + 旁白 + 成片 |
@@ -131,7 +143,7 @@ python job_run.py --help
 
 ### `--from` 可选阶段
 
-`download` → `prepare_video` → `prepare_cues` → `merge` → `translate` → `tts` → `narration` → `compose`
+`download` → `prepare_video` → `transcribe` → `prepare_cues` → `merge` → `translate` → `tts` → `narration` → `compose`
 
 ## 命令行案例
 
@@ -281,7 +293,7 @@ python job_run.py --work work/VIDEO_ID --no-resume --mode all
 # 只下载
 python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --mode download
 
-# 下载+切源+字幕 cues+merge+翻译（到 segments.json 有中文）
+# 下载+切源+转录+字幕 cues+merge+翻译（到 segments.json 有中文）
 python job_run.py --work work/VIDEO_ID --mode prepare
 # 别名：
 python job_run.py --work work/VIDEO_ID --prepare-only
@@ -320,6 +332,9 @@ python job_run.py --work work/VIDEO_ID --from compose
 
 # 字幕合并策略要重来
 python job_run.py --work work/VIDEO_ID --from merge
+
+# 重新转录本地字幕（换模型 / 改静音阈值后）
+python job_run.py --work work/VIDEO_ID --from transcribe
 
 # 源片要重切（例如改了 --end）
 python job_run.py --work work/VIDEO_ID --end 0 --from prepare_video
@@ -471,7 +486,7 @@ python job_run.py --work work/VIDEO_ID --end 180 --mode clean --yes
 
 ```text
 stages:
-  download → prepare_video → prepare_cues → merge
+  download → prepare_video → transcribe → prepare_cues → merge
   → translate → tts → narration → compose
 ```
 
@@ -494,6 +509,7 @@ RESUME: python job_run.py --work ... --resume
 
 ```text
 STAGE: download-video
+STAGE: transcribe        # parakeet-mlx 本地转录
 STAGE: translate | concurrency=2 batch ...
 STAGE: translate | 补译第 1/2 轮 ...
 STAGE: tts | concurrency=2 ...
@@ -512,6 +528,7 @@ STAGE: job-done
 | `out.mp4` | 整片成品（可含 1s 封面；`--mode clean --yes` 后通常只剩这个） |
 | `output/<中文标题> [id].mp4` | `--output` / `OUTPUT_DIR` 导出的可读文件名（预览为 `.preview.mp4`） |
 | `out_preview.mp4` | 预览（`--end>0`） |
+| `asr.srt` | parakeet-mlx 本地转录的英文句级字幕（带标点） |
 | `segments.json` | 分段中枢（可手改 `zh`） |
 | `job_state.json` | 工程状态 |
 | `validation.json` | 最近 TTS 校验 |
@@ -525,6 +542,9 @@ STAGE: job-done
 
 | 现象 | 处理 |
 |---|---|
+| `transcribe` 报 parakeet-mlx 未安装 | conda python3 里 `pip install parakeet-mlx` 后重跑（首次会下载 HF 模型） |
+| 转录太慢 | 调大 `PARAKEET_CHUNK_DURATION` / 关分块；或换 `PARAKEET_DECODING=beam` 保准确率（更慢） |
+| 换转录模型/改静音阈值后没生效 | `python job_run.py --work DIR --from transcribe` 重新转录 |
 | 翻译 API 空响应/漏句多 | 已有多轮补译；仍缺则看 fallback 日志，可调大 `TRANSLATE_REFILL_MAX_ROUNDS` 后 `--mode translate` |
 | 翻译太慢 | `.env` 调大 `TRANSLATE_CONCURRENCY`（如 3～4），注意 API 限流 |
 | 缺音频 | `python job_run.py --work DIR --mode tts --resume` |

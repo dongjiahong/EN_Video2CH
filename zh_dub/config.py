@@ -147,6 +147,13 @@ class Settings:
     ffprobe: str
     edge_tts: str
     modelscope_base_url: str
+    subtitle_source: str
+    parakeet_model: str
+    parakeet_silence_gap: float
+    parakeet_chunk_duration: float
+    parakeet_overlap_duration: float
+    parakeet_decoding: str
+    parakeet_beam_size: int
     translate_batch_size: int
     translate_max_retries: int
     translate_concurrency: int
@@ -175,6 +182,14 @@ class Settings:
             quality = "best"
         if quality not in {"720", "1080", "best"}:
             raise SystemExit("QUALITY must be 720, 1080, or best")
+
+        subtitle_source = (os.getenv("SUBTITLE_SOURCE") or "asr").strip().lower()
+        if subtitle_source not in {"asr", "auto"}:
+            raise SystemExit("SUBTITLE_SOURCE must be asr or auto")
+
+        parakeet_decoding = (os.getenv("PARAKEET_DECODING") or "greedy").strip().lower()
+        if parakeet_decoding not in {"greedy", "beam"}:
+            raise SystemExit("PARAKEET_DECODING must be greedy or beam")
 
         api_key = (os.getenv("API_KEY") or "").strip()
         model = (os.getenv("MODEL") or "").strip()
@@ -236,6 +251,21 @@ class Settings:
             ),
             tts_concurrency=max(1, int(os.getenv("TTS_CONCURRENCY") or "2")),
             tts_max_rate=max(0, int(os.getenv("TTS_MAX_RATE") or "30")),
+            subtitle_source=subtitle_source,
+            parakeet_model=(
+                os.getenv("PARAKEET_MODEL") or "mlx-community/parakeet-tdt-0.6b-v3"
+            ).strip(),
+            parakeet_silence_gap=max(
+                0.0, float(os.getenv("PARAKEET_SILENCE_GAP") or "2.0")
+            ),
+            parakeet_chunk_duration=max(
+                0.0, float(os.getenv("PARAKEET_CHUNK_DURATION") or "120")
+            ),
+            parakeet_overlap_duration=max(
+                0.0, float(os.getenv("PARAKEET_OVERLAP_DURATION") or "15")
+            ),
+            parakeet_decoding=parakeet_decoding,
+            parakeet_beam_size=max(1, int(os.getenv("PARAKEET_BEAM_SIZE") or "5")),
             cover_image=cover_image,
             output_dir=output_dir,
             env_files=env_files,

@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .asr import transcribe_to_srt
 from .captions import (
     Segment,
     build_segments,
@@ -38,7 +39,6 @@ from .logutil import (
 from .export import ensure_titles, publish_output
 from .media import (
     clear_proxy_env,
-    download_subs,
     download_video,
     fetch_video_meta,
     ffprobe_duration,
@@ -702,10 +702,19 @@ class Pipeline:
                 changed = True
 
         if (self.work / "source_full.mp4").is_file() or (self.work / "source.mp4").is_file():
-            if (self.work / "source.en.vtt").is_file() or (self.work / "source.en.srt").is_file():
-                mark("download", inferred=True)
+            mark("download", inferred=True)
         if (self.work / "source.mp4").is_file():
             mark("prepare_video", inferred=True)
+        if (self.work / "asr.srt").is_file():
+            try:
+                asr_n = len(load_cues(self.work / "asr.srt"))
+            except Exception:  # noqa: BLE001
+                asr_n = 0
+            mark("transcribe", inferred=True, cues=asr_n)
+        elif (self.work / "source.srt").is_file() and self.settings.subtitle_source == "asr":
+            # Old work dirs from the YouTube-VTT era carry a legacy source.srt
+            # without an asr.srt; leave transcribe pending so the new stage runs.
+            pass
 
         seg_path = self.work / "segments.json"
         if seg_path.is_file():
@@ -891,9 +900,8 @@ class Pipeline:
             stage("download")
             clear_proxy_env()  # only yt-dlp uses explicit env proxy
             info_v = download_video(self.settings, url, self.work)
-            sub = download_subs(self.settings, url, self.work)
-            highlight(f"下载完成  video={info_v}  subs={sub}")
-            self.state.set_done("download", video=info_v, subs=sub)
+            highlight(f"下载完成  video={info_v}")
+            self.state.set_done("download", video=info_v)
             stage_done("download")
         except Exception as e:  # noqa: BLE001
             stage_error("download", str(e))
@@ -923,6 +931,31 @@ class Pipeline:
             self.state.set_failed("prepare_video", str(e), retryable=True)
             raise
 
+    def _subtitle_prefer(self) -> list[str]:
+        """Names resolve_subtitle should try, by SUBTITLE_SOURCE."""
+        if self.settings.subtitle_source == "auto":
+            return ("asr.srt", "source.srt", "source.en.srt")
+        return ("asr.srt",)
+
+    def step_transcribe(self) -> Path:
+        if self.state.is_done("transcribe"):
+            p = self.work / "asr.srt"
+            if p.is_file() and p.stat().st_size > 0:
+                skip(f"transcribe 已完成  -> {p.name}")
+                return p
+            warn("transcribe 标记完成但缺 asr.srt，重新转录")
+        self.state.set_running("transcribe")
+        try:
+            stage("transcribe")
+            out, n = transcribe_to_srt(self.settings, self.work)
+            stage_done("transcribe", f"cues={n} file={out.name}")
+            self.state.set_done("transcribe", cues=n, file=str(out))
+            return out
+        except Exception as e:  # noqa: BLE001
+            stage_error("transcribe", str(e))
+            self.state.set_failed("transcribe", str(e), retryable=True)
+            raise
+
     def step_prepare_cues(self) -> list[tuple[float, float, str]]:
         if self.state.is_done("prepare_cues"):
             data = self.state.read_json("cues.json")
@@ -932,7 +965,7 @@ class Pipeline:
         self.state.set_running("prepare_cues")
         try:
             stage("prepare_cues")
-            sub = resolve_subtitle(self.work)
+            sub = resolve_subtitle(self.work, prefer=self._subtitle_prefer())
             info(f"字幕源  {sub.name}")
             cues = load_cues(sub)
             t0, t1 = 0.0, (1e12 if self.end <= 0 else self.end)
@@ -962,9 +995,9 @@ class Pipeline:
         self.state.set_running("merge")
         try:
             stage("merge")
-            sub = resolve_subtitle(self.work)
+            sub = resolve_subtitle(self.work, prefer=self._subtitle_prefer())
             t1 = None if self.end <= 0 else float(self.end)
-            info(f"输入字幕 {sub.name}，按词级停顿打包")
+            info(f"输入字幕 {sub.name}，按标点断句")
             segs = build_segments(sub, t0=0.0, t1=t1)
             self.state.write_json("segments_en.json", [s.__dict__ for s in segs])
             # also keep work/segments.json skeleton if absent
@@ -1427,6 +1460,7 @@ class Pipeline:
 
         def do_prepare() -> list[Segment]:
             self.step_prepare_video()
+            self.step_transcribe()
             cues = self.step_prepare_cues()
             segs = self.step_merge(cues)
             segs = self.step_translate(segs)
@@ -1434,6 +1468,7 @@ class Pipeline:
 
         def do_tts_mux() -> Path:
             self.step_prepare_video()
+            self.step_transcribe()
             self.step_tts()
             self.step_narration()
             return self.step_compose()
@@ -1454,15 +1489,19 @@ class Pipeline:
                 do_prepare()
             elif mode == "translate":
                 self.step_prepare_video()
+                if not self.state.is_done("transcribe"):
+                    self.step_transcribe()
                 if not self.state.is_done("merge"):
                     cues = self.step_prepare_cues()
                     self.step_merge(cues)
                 self.step_translate()
             elif mode == "tts":
                 self.step_prepare_video()
+                self.step_transcribe()
                 self.step_tts()
             elif mode == "mux":
                 self.step_prepare_video()
+                self.step_transcribe()
                 self.step_narration()
                 out = self.step_compose()
             elif mode == "tts-mux":
@@ -1474,6 +1513,8 @@ class Pipeline:
                 if url and (not resume or not self.state.is_done("download")):
                     self.ensure_media_from_url(url)
                 self.step_prepare_video()
+                if not self.state.is_done("transcribe"):
+                    self.step_transcribe()
                 if not self.state.is_done("prepare_cues"):
                     self.step_prepare_cues()
                 if not self.state.is_done("merge"):

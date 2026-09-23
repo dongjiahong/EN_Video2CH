@@ -149,11 +149,6 @@ def download_video(settings: Settings, url: str, work: Path) -> dict:
             "mp4",
             "--remux-video",
             "mp4",
-            "--write-auto-sub",
-            "--sub-lang",
-            "en",
-            "--sub-format",
-            "vtt",
             "-o",
             str(work / "source_full.%(ext)s"),
             url,
@@ -166,42 +161,6 @@ def download_video(settings: Settings, url: str, work: Path) -> dict:
     size_mb = full.stat().st_size / (1024 * 1024)
     highlight(f"视频已下载  {wh or '?'}  {size_mb:.1f}MB")
     return {"skipped": False, "file": str(full), "res": wh, "size_mb": round(size_mb, 1)}
-
-
-def download_subs(settings: Settings, url: str, work: Path) -> dict:
-    info("下载字幕")
-    target_vtt = work / "source.en.vtt"
-    target_srt = work / "source.en.srt"
-    if target_vtt.is_file() or target_srt.is_file():
-        skip("本地字幕已存在，跳过")
-        return {"skipped": True}
-
-    full_vtt = work / "source_full.en.vtt"
-    if full_vtt.is_file():
-        target_vtt.write_bytes(full_vtt.read_bytes())
-        ok("字幕已从 source_full.en.vtt 复制")
-        return {"skipped": False, "file": str(target_vtt)}
-
-    env = with_proxy_env(settings.proxy)
-    run_cmd(
-        [
-            settings.yt_dlp,
-            "--skip-download",
-            "--write-auto-sub",
-            "--sub-lang",
-            "en",
-            "--sub-format",
-            "vtt",
-            "-o",
-            str(work / "source.%(ext)s"),
-            url,
-        ],
-        env=env,
-    )
-    if not target_vtt.is_file() and not target_srt.is_file():
-        raise RuntimeError("subtitle download failed")
-    ok("字幕下载完成")
-    return {"skipped": False, "file": str(target_vtt if target_vtt.is_file() else target_srt)}
 
 
 def resolve_video_id(settings: Settings, url: str) -> str:

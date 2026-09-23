@@ -120,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "download",
             "prepare_video",
+            "transcribe",
             "prepare_cues",
             "merge",
             "translate",

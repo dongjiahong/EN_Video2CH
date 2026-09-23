@@ -11,6 +11,7 @@ from .logutil import format_status_line, log
 STAGES = [
     "download",
     "prepare_video",
+    "transcribe",
     "prepare_cues",
     "merge",
     "translate",
