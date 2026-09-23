@@ -50,3 +50,5 @@ assets
 .cache/
 
 *.txt
+
+tmp
