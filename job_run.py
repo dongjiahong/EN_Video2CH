@@ -199,6 +199,7 @@ def _run_one(
     output_dir: Path | None = None,
     title_en: str | None = None,
     video_id: str | None = None,
+    seq: int | None = None,
 ) -> tuple[int, Path | None, Path | None, str]:
     """
     Run a single job.
@@ -217,6 +218,7 @@ def _run_one(
             output_dir=output_dir,
             title_en=title_en,
             video_id=video_id,
+            seq=seq,
         )
         out = pipe.run(
             url=url,
@@ -264,6 +266,7 @@ def _run_url_batch(
     failed_path: Path,
     label: str,
     output_dir: Path | None,
+    offset: int = 0,
 ) -> int:
     mode = args.mode
     if mode in {"status", "clean"}:
@@ -290,6 +293,8 @@ def _run_url_batch(
         work = None
         if item.get("id"):
             work = str(settings.workdir / str(item["id"]))
+        # playlist items carry their absolute index; file-list items use offset+i
+        seq = item.get("index") or (offset + i)
         code, work_dir, out, err = _run_one(
             settings,
             url=url,
@@ -303,6 +308,7 @@ def _run_url_batch(
             output_dir=output_dir,
             title_en=title or None,
             video_id=item.get("id"),
+            seq=seq,
         )
         elapsed = time.time() - t0
         if code == 130:
@@ -369,6 +375,7 @@ def _run_file_batch(
         failed_path=failed_path,
         label=f"file={list_path}",
         output_dir=output_dir,
+        offset=offset,
     )
 
 
@@ -394,6 +401,7 @@ def _run_playlist_batch(
         failed_path=failed_path,
         label=f"playlist={data.get('title') or args.url}",
         output_dir=output_dir,
+        offset=offset,
     )
 
 
@@ -468,6 +476,8 @@ def main(argv: list[str] | None = None) -> int:
         force_from=args.force_from,
         clean_yes=bool(args.yes),
         output_dir=output_dir,
+        # single non-playlist URL exports as 01_; --work reruns keep stored meta.seq
+        seq=1 if args.url and not args.work else None,
     )
     if code != 0:
         return code

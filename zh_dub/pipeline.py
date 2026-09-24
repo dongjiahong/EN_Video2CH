@@ -670,6 +670,7 @@ class Pipeline:
         output_dir: Path | None = None,
         title_en: str | None = None,
         video_id: str | None = None,
+        seq: int | None = None,
     ):
         self.settings = settings
         self.work = work.resolve()
@@ -687,6 +688,8 @@ class Pipeline:
             meta_kw["video_id"] = video_id
         if title_en:
             meta_kw["title_en"] = title_en
+        if seq is not None:
+            meta_kw["seq"] = seq
         if self.output_dir is not None:
             meta_kw["output_dir"] = str(self.output_dir)
         self.state.update_meta(**meta_kw)

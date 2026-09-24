@@ -27,11 +27,18 @@ def safe_stem(title: str, video_id: str, *, max_len: int = 80) -> str:
     return f"{t} [{video_id}]"
 
 
-def export_filename(title: str, video_id: str, *, preview: bool = False) -> str:
+def export_filename(
+    title: str,
+    video_id: str,
+    *,
+    preview: bool = False,
+    seq: int | None = None,
+) -> str:
     stem = safe_stem(title, video_id)
+    prefix = f"{seq:02d}_" if seq is not None else ""
     if preview:
-        return f"{stem}.preview.mp4"
-    return f"{stem}.mp4"
+        return f"{prefix}{stem}.preview.mp4"
+    return f"{prefix}{stem}.mp4"
 
 
 def _same_file(a: Path, b: Path) -> bool:
@@ -77,7 +84,8 @@ def publish_output(
     title_zh = str(meta.get("title_zh") or "").strip()
     title_en = str(meta.get("title_en") or "").strip()
     title = title_zh or title_en or video_id
-    name = export_filename(title, video_id, preview=preview)
+    seq = meta.get("seq")
+    name = export_filename(title, video_id, preview=preview, seq=seq)
     dest = output_dir / name
     if _same_file(src, dest):
         meta["output_file"] = str(dest)
