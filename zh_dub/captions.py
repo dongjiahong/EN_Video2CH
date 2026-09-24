@@ -493,6 +493,15 @@ def drop_fillers(text: str) -> str:
     return re.sub(r"\s+", " ", out).strip(" ,")
 
 
+_PUNCT_ONLY_RE = re.compile(r"[A-Za-z0-9]|[\u4e00-\u9fff]|[\uff10-\uff19\uff21-\uff3a\uff41-\uff5a]")
+
+
+def is_punct_only(text: str) -> bool:
+    """True when text has no readable content, only punctuation/whitespace."""
+    t = (text or "").strip()
+    return bool(t) and not _PUNCT_ONLY_RE.search(t)
+
+
 def parse_numbered_zh(text: str, expected: int) -> dict[int, str]:
     found: dict[int, str] = {}
     for m in NUM_LINE_RE.finditer(text.replace("\r\n", "\n")):
@@ -521,7 +530,7 @@ def write_srt(segs: list[Segment], path: Path, field: str = "zh") -> None:
     n = 1
     for seg in segs:
         text = getattr(seg, field).strip()
-        if not text:
+        if not text or is_punct_only(text):
             continue
         lines.append(str(n))
         lines.append(
@@ -590,7 +599,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events: list[str] = []
     for seg in segs:
         zh = (seg.zh or "").replace("\n", " ").replace("{", "(").replace("}", ")").strip()
-        if not zh:
+        if not zh or is_punct_only(zh):
             continue
         zh = _wrap_zh_line(zh, max_chars=max_chars)
         st, et = _ass_ts(seg.start), _ass_ts(seg.end)

@@ -225,7 +225,7 @@ python job_run.py -f video_list.txt --limit 20,40
 | 处理顺序 | 从上到下**一条一条**跑；每条独立 `work/<id>/` |
 | 失败策略 | **不重试**；记入失败文件后继续下一条 |
 | 失败文件 | 默认与 list 同目录：`video_failed.txt`（**追加**写入） |
-| 失败格式 | `URL<TAB>错误摘要` |
+| 失败格式 | `[时间戳] URL<TAB>错误摘要`（行首本地时间，tab 分隔 URL 与错误） |
 | 成功 | 正常产出 `work/<id>/out.mp4`（或预览 `out_preview.mp4`） |
 | 中断 | `Ctrl+C` 停止整批；已写入的 failed 记录保留 |
 | 退出码 | 有任意失败 → `1`；全部成功 → `0`；用户中断 → `130` |
@@ -236,11 +236,11 @@ python job_run.py -f video_list.txt --limit 20,40
 失败文件示例：
 
 ```text
-https://www.youtube.com/watch?v=aaa	download failed: ...
-https://www.youtube.com/watch?v=bbb	TTS incomplete: missing [12, 15]
+[2026-09-24 10:00:00] https://www.youtube.com/watch?v=aaa	download failed: ...
+[2026-09-24 10:00:05] https://www.youtube.com/watch?v=bbb	TTS incomplete: missing [12, 15]
 ```
 
-只重跑失败的：把 `video_failed.txt` 里的 URL 拷到新列表（去掉 `\t` 后错误摘要），再 `-f` 一次；或对单个 id：
+只重跑失败的：把 `video_failed.txt` 每行的 URL 拷到新列表（去掉行首 `[时间戳] ` 前缀与 `\t` 后的错误摘要），再 `-f` 一次；或对单个 id：
 
 ```bash
 python job_run.py --work work/VIDEO_ID --resume
@@ -548,6 +548,7 @@ STAGE: job-done
 | 翻译 API 空响应/漏句多 | 已有多轮补译；仍缺则看 fallback 日志，可调大 `TRANSLATE_REFILL_MAX_ROUNDS` 后 `--mode translate` |
 | 翻译太慢 | `.env` 调大 `TRANSLATE_CONCURRENCY`（如 3～4），注意 API 限流 |
 | 缺音频 | `python job_run.py --work DIR --mode tts --resume` |
+| 中文只剩标点导致 TTS 失败（`No audio was received`） | 纯标点段会自动跳过（不发 TTS、字幕不显示），重跑 `--mode tts` 即可 |
 | TTS 太慢 | `.env` 调大 `TTS_CONCURRENCY`（如 8），再 `--mode tts` |
 | yt-dlp 网络失败 | 检查 `PROXY` |
 | ModelScope 401 | 检查 `API_KEY`（翻译不走代理） |

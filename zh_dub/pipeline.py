@@ -15,6 +15,7 @@ from .captions import (
     Segment,
     build_segments,
     drop_fillers,
+    is_punct_only,
     load_cues,
     load_segments,
     resolve_subtitle,
@@ -180,7 +181,7 @@ async def fit_segment_async(
     Only if still overflow after max rate: try compressed zh (same 1~2 calls).
     """
     text = seg.zh.strip()
-    if not text:
+    if not text or is_punct_only(text):
         seg.note = "empty_zh"
         seg.fitted = True
         return seg
@@ -342,7 +343,8 @@ def _segment_audio_candidates(work: Path, seg: Segment) -> list[Path]:
 
 
 def validate_tts(work: Path, segs: list[Segment]) -> dict[str, Any]:
-    need = [s for s in segs if (s.zh or "").strip()]
+    # punctuation-only segments are silent placeholders, no audio required
+    need = [s for s in segs if (s.zh or "").strip() and not is_punct_only(s.zh)]
     ok_idx: list[int] = []
     missing: list[int] = []
     bad: list[int] = []

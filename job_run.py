@@ -176,12 +176,13 @@ def _load_url_list(path: Path) -> list[str]:
 
 def _append_failed(failed_path: Path, url: str, err: str) -> None:
     failed_path.parent.mkdir(parents=True, exist_ok=True)
-    # one line: url \t error (single-line)
+    # one line: [timestamp] url \t error (single-line)
     msg = " ".join(str(err).splitlines()).strip()
     if len(msg) > 300:
         msg = msg[:297] + "..."
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     with failed_path.open("a", encoding="utf-8") as f:
-        f.write(f"{url}\t{msg}\n")
+        f.write(f"[{ts}] {url}\t{msg}\n")
 
 
 def _run_one(
