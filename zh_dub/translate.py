@@ -30,11 +30,44 @@ class TranslateError(RuntimeError):
         self.extra = extra
 
 
-def _client(settings: Settings):
+# --- API key pool: 余额不足的 key 本轮永久弃用，切下一个 ---
+_KEY_LOCK = threading.Lock()
+_KEYS: tuple[str, ...] = ()
+_RETIRED: set[str] = set()
+
+
+def _ensure_keys(keys: tuple[str, ...]) -> str:
+    """Rebuild the pool when the key set changes; return the current alive key."""
+    global _KEYS, _RETIRED
+    if keys != _KEYS:
+        _KEYS, _RETIRED = keys, set()
+    for k in _KEYS:
+        if k not in _RETIRED:
+            return k
+    raise TranslateError("所有 API_KEY 均余额不足", retryable=False)
+
+
+def _client(settings: Settings) -> tuple[Any, str]:
     from openai import OpenAI
 
     clear_proxy_env()
-    return OpenAI(api_key=settings.api_key, base_url=settings.modelscope_base_url)
+    with _KEY_LOCK:
+        key = _ensure_keys(tuple(settings.api_keys))
+    return OpenAI(api_key=key, base_url=settings.modelscope_base_url), key
+
+
+def _is_balance_error(low: str) -> bool:
+    return "insufficient balance" in low or "insufficient_quota" in low
+
+
+def _rotate_from(key: str) -> str | None:
+    """Retire the failing key; return the next alive key, or None if exhausted."""
+    with _KEY_LOCK:
+        _RETIRED.add(key)
+        for k in _KEYS:
+            if k not in _RETIRED:
+                return k
+        return None
 
 
 def _is_english_fallback(zh: str | None, en: str) -> bool:
@@ -66,7 +99,6 @@ def translate_chunk(
     extra_title, if set, is appended as the last numbered line in the same
     request (video title, not narration). Caller should pop that extra id.
     """
-    client = _client(settings)
     model = settings.model
     work_items = list(items)
     title_en = (extra_title or "").strip()
@@ -119,27 +151,47 @@ def translate_chunk(
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            detail(f"API 尝试 {attempt}/{retries}  (n={n}, thinking on)")
-            create_kwargs = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.2,
-                "extra_body": {"thinking": {"type": "enabled"}},
-            }
-            try:
-                resp = client.chat.completions.create(
-                    reasoning_effort="high", **create_kwargs
-                )
-            except TypeError:
-                resp = client.chat.completions.create(**create_kwargs)
-            except Exception as e1:
-                if "reasoning_effort" in str(e1).lower() or "unexpected" in str(e1).lower():
-                    resp = client.chat.completions.create(**create_kwargs)
-                else:
-                    raise
+            while True:  # 余额不足切 key 重投，不计入重试次数
+                client, used_key = _client(settings)
+                detail(f"API 尝试 {attempt}/{retries}  (n={n}, thinking on)")
+                create_kwargs = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "temperature": 0.2,
+                    "extra_body": {"thinking": {"type": "enabled"}},
+                }
+                try:
+                    try:
+                        resp = client.chat.completions.create(
+                            reasoning_effort="high", **create_kwargs
+                        )
+                    except TypeError:
+                        resp = client.chat.completions.create(**create_kwargs)
+                    except Exception as e1:
+                        if (
+                            "reasoning_effort" in str(e1).lower()
+                            or "unexpected" in str(e1).lower()
+                        ):
+                            resp = client.chat.completions.create(**create_kwargs)
+                        else:
+                            raise
+                except Exception as e:  # noqa: BLE001
+                    low = str(e).lower()
+                    if not _is_balance_error(low):
+                        raise
+                    warn(f"翻译尝试 {attempt} 失败: {e}")
+                    if _rotate_from(used_key) is None:
+                        raise TranslateError(
+                            f"所有 API_KEY({len(settings.api_keys)} 个)"
+                            f"余额不足: {e}",
+                            retryable=False,
+                        ) from e
+                    warn("Key 余额不足，切换下一个 key 重投（不计入重试次数）")
+                    continue
+                break
 
             if resp is None or not getattr(resp, "choices", None):
                 raise TranslateError(
@@ -453,7 +505,7 @@ def translate_segments(
                     state.set_failed(
                         "translate",
                         str(e),
-                        retryable=True,
+                        retryable=getattr(e, "retryable", True),
                         batch=bi + 1,
                         done_batches=[b + 1 for b in done_batches],
                         saved_lines=sum(1 for x in out if x),

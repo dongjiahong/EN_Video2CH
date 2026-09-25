@@ -47,6 +47,7 @@ python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --output ./ou
 - 走 OpenAI 兼容接口调 DeepSeek 等模型，Prompt 内置**金融/价格行为术语纠错**与口播化要求。
 - **按 batch 并发翻译**（`TRANSLATE_CONCURRENCY`，默认 2），每批落盘 `checkpoints/translate/batch_*.json`。
 - 主翻译全部结束后，对缺失句**多轮补译**（默认最多 2 轮，零进展提前停），结果写 `checkpoints/translate/refill.json`。
+- `API_KEY` 支持**逗号分隔多个 key**：某个 key 报 `insufficient balance` 时自动切下一个重投（切换不占重试次数），全都没余额则立即失败、可 `--resume` 续跑。
 - 翻译缺失的句子用英文回填并在下次运行时自动识别、重新补译（自愈）。
 - 视频标题随第一批正文顺带翻译（不单独发请求）。
 
@@ -188,7 +189,7 @@ cp .env.example .env
 
 | 变量 | 说明 |
 |---|---|
-| `API_KEY` | ModelScope API Key（翻译必填） |
+| `API_KEY` | ModelScope API Key（翻译必填）；多个用逗号分隔，余额不足自动切换 |
 | `MODEL` | 翻译模型，如 `deepseek-ai/DeepSeek-V4.1-Flash` |
 
 常用（均有默认值）：
@@ -566,6 +567,7 @@ python job_run.py --work work/VIDEO_ID --mode clean --yes  # 真正删除
 | 中文只剩标点导致 TTS 失败（No audio received） | 纯标点段自动跳过（不发 TTS、字幕不显示），重跑 `--mode tts` 即可 |
 | yt-dlp 网络失败 | 检查 `PROXY` |
 | ModelScope 401 | 检查 `API_KEY`（翻译不走代理） |
+| 翻译报 `insufficient balance` | 该 key 余额不足；配了多个 key 会自动切换。全都没余额则失败，补 key 后 `--from translate --resume` |
 | `Unknown filter ass` | 安装带 libass 的 ffmpeg（如 `ffmpeg-full`） |
 | narration ffmpeg exit 232 / amix 爆 | 已改 PCM 拼接；`--from narration` 重跑 |
 | compose 显示 done 但片不对 / 时长被截断 | `--from compose` 或 `--mode mux`（会校验 out 时长） |

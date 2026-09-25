@@ -135,7 +135,7 @@ def resolve_python() -> str:
 @dataclass
 class Settings:
     root: Path
-    api_key: str
+    api_keys: list[str]
     model: str
     proxy: str
     voice: str
@@ -191,9 +191,15 @@ class Settings:
         if parakeet_decoding not in {"greedy", "beam"}:
             raise SystemExit("PARAKEET_DECODING must be greedy or beam")
 
-        api_key = (os.getenv("API_KEY") or "").strip()
+        api_keys = [
+            k.strip()
+            for k in re.split(r"[,\s]+", os.getenv("API_KEY") or "")
+            if k.strip()
+        ]
+        seen_keys: set[str] = set()
+        api_keys = [k for k in api_keys if not (k in seen_keys or seen_keys.add(k))]
         model = (os.getenv("MODEL") or "").strip()
-        if not api_key or not model:
+        if not api_keys or not model:
             raise SystemExit(f"缺少 API_KEY / MODEL，请写在 {root / '.env'}")
 
         cover_raw = (os.getenv("COVER_IMAGE") or "").strip()
@@ -218,7 +224,7 @@ class Settings:
 
         return cls(
             root=root,
-            api_key=api_key,
+            api_keys=api_keys,
             model=model,
             proxy=(os.getenv("PROXY") or "http://127.0.0.1:7890").strip(),
             voice=(os.getenv("VOICE") or "zh-CN-YunyangNeural").strip(),
