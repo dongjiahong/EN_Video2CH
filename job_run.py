@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""MyRose 本地中文配音入口（纯 Python，带状态与断点续跑）
+"""EN_Video2CH 入口：英文视频 → 中文配音 + 中文字幕成片（状态落盘、断点续跑）
 
 推荐用 conda 环境:
   conda activate python3
   python job_run.py --work work/ID --status
 
 若直接 ./job_run.py，会读取 .env 里的 PYTHON（默认 conda python3）并自动切换。
+
+常用命令:
+  python job_run.py --url URL                    # 整条流水线
+  python job_run.py --url URL --end 60           # 预览前 60 秒
+  python job_run.py --work work/ID --from tts    # 从某个阶段重做
+  python job_run.py --work work/ID --to translate  # 只跑到翻译
+  python job_run.py --work work/ID --clean --yes # 清理中间件，只留成片
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -38,24 +46,45 @@ def _bootstrap_reexec() -> None:
 
 _bootstrap_reexec()
 
-from zh_dub.config import Settings  # noqa: E402
+from zh_dub.clean import clean_work  # noqa: E402
+from zh_dub.config import Settings, normalize_quality  # noqa: E402
+from zh_dub.export import publish_output  # noqa: E402
 from zh_dub.logutil import (  # noqa: E402
     detail,
+    format_status_line,
     highlight,
     info,
     keyval,
+    log,
     stage,
     stage_done,
     warn,
 )
-from zh_dub.pipeline import Pipeline, resolve_work_dir  # noqa: E402
-from zh_dub.sources import (
+from zh_dub.runner import Job, Runner  # noqa: E402
+from zh_dub.segments import load_segments  # noqa: E402
+from zh_dub.sources import (  # noqa: E402
     apply_limit,
     fetch_playlist,
     is_playlist_url,
     parse_limit,
     resolve_output_dir,
-)  # noqa: E402
+    resolve_work_dir,
+)
+from zh_dub.state import STAGES, JobState  # noqa: E402
+from zh_dub.tts import validate_tts  # noqa: E402
+
+STATUS_KEYS = (
+    "segments",
+    "cues",
+    "audio_ok",
+    "missing",
+    "overflow",
+    "progress",
+    "clips",
+    "duration",
+    "size_mb",
+    "out",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,11 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="job_run.py",
         description="EN video -> ZH narration (stateful, resumable)",
     )
-    p.add_argument(
-        "--url",
-        default=None,
-        help="YouTube video or playlist URL (playlist expands to batch)",
-    )
+    p.add_argument("--url", default=None, help="YouTube video or playlist URL (playlist expands to batch)")
     p.add_argument("--work", default=None, help="existing work dir")
     p.add_argument(
         "-f",
@@ -81,11 +106,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="where to append failed URLs (default: <list_dir>/video_failed.txt)",
     )
+    p.add_argument(
+        "--from",
+        dest="from_stage",
+        default=None,
+        choices=STAGES,
+        help="redo this stage and everything after it",
+    )
+    p.add_argument(
+        "--to",
+        dest="to_stage",
+        default=None,
+        choices=STAGES,
+        help="stop after this stage",
+    )
     p.add_argument("--end", type=float, default=0.0, help="0=full (default); >0 preview seconds")
     p.add_argument(
         "--output",
         default=None,
-        help="copy finished mp4 here as '<中文标题> [id].mp4' (overrides OUTPUT_DIR)",
+        help="copy finished mp4 here as '<序号_中文标题> [id].mp4' (overrides OUTPUT_DIR)",
     )
     p.add_argument(
         "--limit",
@@ -95,64 +134,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--voice", default=None, help="override VOICE from .env")
     p.add_argument("--quality", default=None, help="720|1080|best override")
-    p.add_argument(
-        "--mode",
-        default="all",
-        choices=[
-            "all",
-            "prepare",
-            "translate",
-            "tts",
-            "mux",
-            "tts-mux",
-            "download",
-            "status",
-            "clean",
-        ],
-        help="pipeline mode (default all)",
-    )
-    p.add_argument("--resume", action="store_true", help="resume from job_state.json")
-    p.add_argument("--no-resume", action="store_true", help="ignore done flags where possible")
-    p.add_argument(
-        "--from",
-        dest="force_from",
-        default=None,
-        choices=[
-            "download",
-            "prepare_video",
-            "transcribe",
-            "prepare_cues",
-            "merge",
-            "translate",
-            "tts",
-            "narration",
-            "compose",
-        ],
-        help="mark this stage and after as pending, then run",
-    )
     p.add_argument("--status", action="store_true", help="print job status and exit")
-    p.add_argument("--prepare-only", action="store_true", help="alias: --mode prepare")
-    p.add_argument("--tts-mux-only", action="store_true", help="alias: --mode tts-mux")
+    p.add_argument("--clean", action="store_true", help="delete intermediates, keep the final video")
     p.add_argument(
         "--yes",
         action="store_true",
-        help="required with --mode clean to actually delete files",
+        help="required with --clean to actually delete files",
     )
     return p
 
 
-def _apply_quality(settings: Settings, quality: str | None) -> None:
-    if not quality:
+def _print_status(job: Job) -> None:
+    stage("status", str(job.work))
+    state = job.state
+    keyval("status", state.data.get("status"))
+    keyval("stage", state.data.get("stage"))
+    keyval("updated", state.data.get("updated_at"))
+    log("stages:")
+    for name in STAGES:
+        bits = [
+            f"{k}={state.stage_detail(name)[k]}"
+            for k in STATUS_KEYS
+            if k in state.stage_detail(name)
+        ]
+        log(format_status_line(name, state.stage_status(name), ("  " + ", ".join(bits)) if bits else ""))
+    err = state.data.get("error")
+    if err:
+        warn(f"{err.get('stage')}: {err.get('message')}")
+        detail(f"续跑: python job_run.py --work {job.work}")
+
+    seg_path = job.path("segments.json")
+    if not seg_path.is_file():
         return
-    q = quality.strip().lower()
-    if q in {"720", "720p"}:
-        settings.quality = "720"
-    elif q in {"1080", "1080p"}:
-        settings.quality = "1080"
-    elif q in {"best", "max", "highest", "source"}:
-        settings.quality = "best"
-    else:
-        raise SystemExit("quality must be 720, 1080, or best")
+    segs = load_segments(seg_path)
+    report = validate_tts(segs, job.path("audio"), job.voice, job.settings.tts_max_rate)
+    highlight(
+        f"实时检查  segments={len(segs)}  zh={sum(1 for s in segs if s.zh.strip())}  "
+        f"audio_ok={report['audio_ok']}  missing={len(report['audio_missing'])}"
+    )
+    if report["audio_missing"][:10]:
+        warn(f"缺失音频 idx 样例: {report['audio_missing'][:10]}")
 
 
 def _load_url_list(path: Path) -> list[str]:
@@ -164,8 +185,7 @@ def _load_url_list(path: Path) -> list[str]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        # allow "url # comment"
-        if " #" in line:
+        if " #" in line:  # allow "url # comment"
             line = line.split(" #", 1)[0].strip()
         if not line or line in seen:
             continue
@@ -176,7 +196,6 @@ def _load_url_list(path: Path) -> list[str]:
 
 def _append_failed(failed_path: Path, url: str, err: str) -> None:
     failed_path.parent.mkdir(parents=True, exist_ok=True)
-    # one line: [timestamp] url \t error (single-line)
     msg = " ".join(str(err).splitlines()).strip()
     if len(msg) > 300:
         msg = msg[:297] + "..."
@@ -185,54 +204,100 @@ def _append_failed(failed_path: Path, url: str, err: str) -> None:
         f.write(f"[{ts}] {url}\t{msg}\n")
 
 
+def _make_job(
+    settings: Settings,
+    work: Path,
+    *,
+    url: str | None,
+    end: float,
+    voice: str,
+    output_dir: Path | None,
+    title_en: str | None,
+    video_id: str | None,
+    seq: int | None,
+) -> Job:
+    state = JobState(work)
+    meta: dict[str, Any] = {"voice": voice, "quality": settings.quality}
+    if url:
+        meta["url"] = url
+    if title_en:
+        meta["title_en"] = title_en
+    if video_id:
+        meta["video_id"] = video_id
+    if seq is not None:
+        meta["seq"] = seq
+    if output_dir is not None:
+        meta["output_dir"] = str(output_dir)
+    state.update_meta(**meta)
+    return Job(
+        settings=settings,
+        work=work,
+        state=state,
+        voice=voice,
+        end=end,
+        url=url,
+        output_dir=output_dir,
+    )
+
+
+def _publish(job: Job) -> Path | None:
+    """Copy/link the finished video into the export dir, when one is configured."""
+    if job.output_dir is None:
+        return None
+    src = job.out
+    if not src.is_file():
+        alt = job.path("out.mp4" if src.name != "out.mp4" else "out_preview.mp4")
+        if not alt.is_file():
+            return None
+        src = alt
+    return publish_output(
+        job.settings,
+        job.state,
+        src,
+        output_dir=job.output_dir,
+        preview=src.name.startswith("out_preview"),
+    )
+
+
 def _run_one(
     settings: Settings,
+    args: argparse.Namespace,
     *,
     url: str | None,
     work: str | None,
-    mode: str,
-    end: float,
-    voice: str | None,
-    resume: bool,
-    force_from: str | None,
-    clean_yes: bool,
-    output_dir: Path | None = None,
+    output_dir: Path | None,
     title_en: str | None = None,
     video_id: str | None = None,
     seq: int | None = None,
 ) -> tuple[int, Path | None, Path | None, str]:
-    """
-    Run a single job.
-    Returns (exit_code, work_dir, output_path, error_message).
-    exit_code: 0 ok, 1 failed, 130 interrupted.
-    """
+    """Run one job. Returns (exit_code, work_dir, output_path, error)."""
     work_dir: Path | None = None
-    pipe: Pipeline | None = None
+    job: Job | None = None
     try:
         work_dir = resolve_work_dir(settings, work, url)
-        pipe = Pipeline(
+        job = _make_job(
             settings,
             work_dir,
-            end=end,
-            voice=voice,
+            url=url,
+            end=args.end,
+            voice=args.voice or settings.voice,
             output_dir=output_dir,
             title_en=title_en,
             video_id=video_id,
             seq=seq,
         )
-        out = pipe.run(
-            url=url,
-            mode=mode,
-            resume=resume,
-            force_from=force_from,
-            clean_yes=clean_yes,
-        )
-        return 0, work_dir, out, ""
+        if args.clean:
+            return 0, work_dir, clean_work(settings, work_dir, job.out, yes=args.yes), ""
+        if args.status:
+            _print_status(job)
+            return 0, work_dir, None, ""
+        Runner(job).run(args.from_stage, args.to_stage)
+        return 0, work_dir, _publish(job), ""
     except KeyboardInterrupt:
         warn("用户中断")
-        if pipe is not None and work_dir is not None:
-            info(f"STATE   {pipe.state.path}")
-            info(f"RESUME  python job_run.py --work {work_dir} --resume")
+        if job is not None and work_dir is not None:
+            info(f"STATE   {job.state.path}")
+            info(f"RESUME  python job_run.py --work {work_dir}")
         return 130, work_dir, None, "interrupted"
     except Exception as e:  # noqa: BLE001
         warn(f"FAILED: {e}")
@@ -248,12 +313,8 @@ def _limit_from_args(args: argparse.Namespace) -> tuple[int, int]:
 
 def _failed_path_for(args: argparse.Namespace, default_parent: Path) -> Path:
     if args.failed_file:
-        failed_path = Path(args.failed_file).expanduser()
-        if not failed_path.is_absolute():
-            failed_path = (Path.cwd() / failed_path).resolve()
-        else:
-            failed_path = failed_path.resolve()
-        return failed_path
+        p = Path(args.failed_file).expanduser()
+        return p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve()
     return (default_parent / "video_failed.txt").resolve()
 
 
@@ -262,16 +323,11 @@ def _run_url_batch(
     args: argparse.Namespace,
     items: list[dict],
     *,
-    resume: bool,
     failed_path: Path,
     label: str,
     output_dir: Path | None,
     offset: int = 0,
 ) -> int:
-    mode = args.mode
-    if mode in {"status", "clean"}:
-        raise SystemExit(f"batch does not support --mode {mode}")
-
     total = len(items)
     ok_n = 0
     fail_n = 0
@@ -290,21 +346,14 @@ def _run_url_batch(
         if title:
             info(f"EN  {title}")
         t0 = time.time()
-        work = None
-        if item.get("id"):
-            work = str(settings.workdir / str(item["id"]))
+        work = str(settings.workdir / str(item["id"])) if item.get("id") else None
         # playlist items carry their absolute index; file-list items use offset+i
         seq = item.get("index") or (offset + i)
         code, work_dir, out, err = _run_one(
             settings,
+            args,
             url=url,
             work=work,
-            mode=mode,
-            end=args.end,
-            voice=args.voice,
-            resume=resume,
-            force_from=args.force_from,
-            clean_yes=False,
             output_dir=output_dir,
             title_en=title or None,
             video_id=item.get("id"),
@@ -330,10 +379,7 @@ def _run_url_batch(
         "batch",
         f"ok={ok_n} fail={fail_n} total={total} elapsed={time.time()-t_all:.1f}s",
     )
-    highlight(
-        f"批量结束  成功={ok_n}  失败={fail_n}  总计={total}  "
-        f"耗时 {time.time()-t_all:.1f}s"
-    )
+    highlight(f"批量结束  成功={ok_n}  失败={fail_n}  总计={total}  耗时 {time.time()-t_all:.1f}s")
     if fail_n:
         keyval("failed_log", failed_path)
         info(f"失败 URL 已写入: {failed_path}")
@@ -342,17 +388,10 @@ def _run_url_batch(
 
 
 def _run_file_batch(
-    settings: Settings,
-    args: argparse.Namespace,
-    *,
-    resume: bool,
-    output_dir: Path | None,
+    settings: Settings, args: argparse.Namespace, *, output_dir: Path | None
 ) -> int:
     list_path = Path(args.url_file).expanduser()
-    if not list_path.is_absolute():
-        list_path = (Path.cwd() / list_path).resolve()
-    else:
-        list_path = list_path.resolve()
+    list_path = list_path.resolve() if list_path.is_absolute() else (Path.cwd() / list_path).resolve()
 
     urls = _load_url_list(list_path)
     if not urls:
@@ -366,13 +405,11 @@ def _run_file_batch(
         )
     if offset or count:
         info(f"列表窗口  全表 {len(items)} 条  本批 {len(sliced)} 条  offset={offset} count={count or 'all'}")
-    failed_path = _failed_path_for(args, list_path.parent)
     return _run_url_batch(
         settings,
         args,
         sliced,
-        resume=resume,
-        failed_path=failed_path,
+        failed_path=_failed_path_for(args, list_path.parent),
         label=f"file={list_path}",
         output_dir=output_dir,
         offset=offset,
@@ -380,25 +417,19 @@ def _run_file_batch(
 
 
 def _run_playlist_batch(
-    settings: Settings,
-    args: argparse.Namespace,
-    *,
-    resume: bool,
-    output_dir: Path | None,
+    settings: Settings, args: argparse.Namespace, *, output_dir: Path | None
 ) -> int:
     stage("playlist", args.url)
     offset, count = _limit_from_args(args)
     data = fetch_playlist(settings, args.url, offset=offset, count=count)
     items = data["items"]
     highlight(f"播放列表  {data.get('title') or ''}  {len(items)} 条")
-    failed_path = _failed_path_for(args, Path.cwd())
     stage_done("playlist", f"items={len(items)}")
     return _run_url_batch(
         settings,
         args,
         items,
-        resume=resume,
-        failed_path=failed_path,
+        failed_path=_failed_path_for(args, Path.cwd()),
         label=f"playlist={data.get('title') or args.url}",
         output_dir=output_dir,
         offset=offset,
@@ -412,69 +443,50 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     args = build_parser().parse_args(argv)
-    if args.prepare_only:
-        args.mode = "prepare"
-    if args.tts_mux_only:
-        args.mode = "tts-mux"
-    if args.status:
-        args.mode = "status"
-
-    resume = True
-    if args.no_resume:
-        resume = False
-    if args.resume:
-        resume = True
+    if args.yes and not args.clean:
+        warn("--yes 只在 --clean 时有效")
 
     t0 = time.time()
     stage("config")
     settings = Settings.load(ROOT)
-    _apply_quality(settings, args.quality)
+    if args.quality:
+        settings.quality = normalize_quality(args.quality)
     for f in settings.env_files:
         detail(f"loaded {f}")
     keyval("python", settings.python)
     keyval("model", settings.model)
     keyval("voice", args.voice or settings.voice)
     keyval("quality", settings.quality)
-    keyval("mode", args.mode)
+    if args.from_stage or args.to_stage:
+        keyval("stages", f"{args.from_stage or STAGES[0]}..{args.to_stage or STAGES[-1]}")
     output_dir = resolve_output_dir(settings, args.output)
     if output_dir is not None:
         keyval("output_dir", output_dir)
-    detail(
-        f"tools yt-dlp={settings.yt_dlp}  ffmpeg={settings.ffmpeg}  "
-        f"edge-tts={settings.edge_tts}"
-    )
+    detail(f"tools yt-dlp={settings.yt_dlp}  ffmpeg={settings.ffmpeg}  ffprobe={settings.ffprobe}")
     stage_done("config")
 
-    # batch mode
     if args.url_file:
         if args.url or args.work:
             warn("批量 -f 模式下忽略 --url / --work")
-        return _run_file_batch(
-            settings, args, resume=resume, output_dir=output_dir
-        )
+        if args.status or args.clean:
+            raise SystemExit("批量模式不支持 --status / --clean")
+        return _run_file_batch(settings, args, output_dir=output_dir)
 
     if args.url and is_playlist_url(args.url):
         if args.work:
             warn("播放列表模式下忽略 --work")
-        if args.mode in {"status", "clean"}:
-            raise SystemExit("playlist URL does not support --mode status/clean")
-        return _run_playlist_batch(
-            settings, args, resume=resume, output_dir=output_dir
-        )
+        if args.status or args.clean:
+            raise SystemExit("播放列表不支持 --status / --clean")
+        return _run_playlist_batch(settings, args, output_dir=output_dir)
 
     if not args.url and not args.work:
         raise SystemExit("Need --url, --work, or -f url_list.txt")
 
     code, work, out, _err = _run_one(
         settings,
+        args,
         url=args.url,
         work=args.work,
-        mode=args.mode,
-        end=args.end,
-        voice=args.voice,
-        resume=resume,
-        force_from=args.force_from,
-        clean_yes=bool(args.yes),
         output_dir=output_dir,
         # single non-playlist URL exports as 01_; --work reruns keep stored meta.seq
         seq=1 if args.url and not args.work else None,
@@ -491,9 +503,9 @@ def main(argv: list[str] | None = None) -> int:
     if work:
         keyval("state", work / "job_state.json")
         info("常用命令:")
-        detail(f"改中文后重做配音:  python job_run.py --work {work} --mode tts-mux")
         detail(f"查看进度:          python job_run.py --work {work} --status")
-        detail(f"失败后续跑:        python job_run.py --work {work} --resume")
+        detail(f"改中文后重做配音:  python job_run.py --work {work} --from tts")
+        detail(f"失败后续跑:        python job_run.py --work {work}")
     stage_done("job-done")
     return 0
 

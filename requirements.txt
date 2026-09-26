@@ -1,3 +1,2 @@
 openai>=2
-python-dotenv
 edge-tts

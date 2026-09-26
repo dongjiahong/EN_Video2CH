@@ -1,45 +1,44 @@
 from __future__ import annotations
 
 import json
+import sys
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .logutil import format_status_line, log
-
 STAGES = [
     "download",
-    "prepare_video",
     "transcribe",
-    "prepare_cues",
-    "merge",
+    "segment",
     "translate",
     "tts",
     "narration",
     "compose",
 ]
 
+STATE_VERSION = 2
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def default_state(work: Path, **meta: Any) -> dict[str, Any]:
+def _blank_stage() -> dict[str, Any]:
+    return {"status": "pending", "detail": {}}
+
+
+def default_state(work: Path) -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": STATE_VERSION,
         "work": str(work),
         "created_at": _now(),
         "updated_at": _now(),
         "status": "pending",  # pending|running|failed|done
         "stage": STAGES[0],
         "error": None,
-        "meta": meta,
-        "stages": {
-            name: {"status": "pending", "detail": {}}
-            for name in STAGES
-        },
-        "resume_hint": f"python job_run.py --work {work} --resume",
+        "meta": {},
+        "stages": {name: _blank_stage() for name in STAGES},
     }
 
 
@@ -55,62 +54,64 @@ class JobState:
         if self.path.is_file():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "stages" in data:
+                if isinstance(data, dict) and data.get("version") == STATE_VERSION:
                     return data
+                print(f"job_state.json version mismatch, recreating: {self.path}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
-                log(f"job_state.json unreadable, recreating: {e}")
+                print(f"job_state.json unreadable, recreating: {e}", file=sys.stderr)
         data = default_state(self.work)
-        self._write(data)
+        self.data = data
+        self.save()
         return data
 
-    def _write(self, data: dict[str, Any] | None = None) -> None:
-        payload = data if data is not None else self.data
-        payload["updated_at"] = _now()
-        payload["work"] = str(self.work)
-        payload["resume_hint"] = f"python job_run.py --work {self.work} --resume"
+    def save(self) -> None:
+        self.data["updated_at"] = _now()
+        self.data["work"] = str(self.work)
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
-    def save(self) -> None:
-        self._write()
+    @property
+    def meta(self) -> dict[str, Any]:
+        return self.data.setdefault("meta", {})
 
     def update_meta(self, **kwargs: Any) -> None:
-        self.data.setdefault("meta", {}).update(kwargs)
+        self.meta.update(kwargs)
         self.save()
+
+    def _stage(self, stage: str) -> dict[str, Any]:
+        return self.data["stages"].setdefault(stage, _blank_stage())
 
     def set_running(self, stage: str) -> None:
         self.data["status"] = "running"
         self.data["stage"] = stage
         self.data["error"] = None
-        st = self.data["stages"].setdefault(stage, {"status": "pending", "detail": {}})
+        st = self._stage(stage)
         st["status"] = "running"
         st["started_at"] = _now()
         self.save()
 
-    def set_done(self, stage: str, **detail: Any) -> None:
-        st = self.data["stages"].setdefault(stage, {"status": "pending", "detail": {}})
-        st["status"] = "done"
-        st["finished_at"] = _now()
-        if detail:
-            st.setdefault("detail", {}).update(detail)
-        self.data["error"] = None
-        # advance pointer to next pending
-        nxt = self.next_pending()
-        self.data["stage"] = nxt or stage
-        if nxt is None and all(
-            self.data["stages"][s]["status"] == "done" for s in STAGES
-        ):
-            self.data["status"] = "done"
-        else:
-            self.data["status"] = "running"
+    def set_progress(self, stage: str, **detail: Any) -> None:
+        self._stage(stage).setdefault("detail", {}).update(detail)
         self.save()
 
-    def set_failed(self, stage: str, message: str, **extra: Any) -> None:
-        st = self.data["stages"].setdefault(stage, {"status": "pending", "detail": {}})
+    def set_done(self, stage: str, **detail: Any) -> None:
+        st = self._stage(stage)
+        st["status"] = "done"
+        st["finished_at"] = _now()
+        st["detail"] = detail
+        st.pop("error", None)
+        self.data["error"] = None
+        nxt = self.next_pending()
+        self.data["stage"] = nxt or stage
+        self.data["status"] = "done" if nxt is None else "running"
+        self.save()
+
+    def set_failed(self, stage: str, message: str) -> None:
+        st = self._stage(stage)
         st["status"] = "failed"
         st["finished_at"] = _now()
-        err = {"message": message, "stage": stage, **extra}
+        err = {"message": message, "stage": stage}
         st["error"] = err
         self.data["status"] = "failed"
         self.data["stage"] = stage
@@ -128,23 +129,20 @@ class JobState:
 
     def next_pending(self) -> str | None:
         for name in STAGES:
-            st = self.stage_status(name)
-            if st in {"pending", "failed", "running"}:
+            if self.stage_status(name) != "done":
                 return name
         return None
 
-    def mark_pending_from(self, stage: str) -> None:
-        if stage not in STAGES:
-            raise SystemExit(f"unknown stage: {stage}")
-        hit = False
-        for name in STAGES:
-            if name == stage:
-                hit = True
-            if hit:
-                self.data["stages"][name] = {"status": "pending", "detail": {}}
-        self.data["status"] = "pending"
-        self.data["stage"] = stage
+    def mark_pending(self, start: str, end: str) -> None:
+        """Forget the [start..end] slice so those stages run again."""
+        if start not in STAGES or end not in STAGES:
+            raise SystemExit(f"unknown stage range: {start}..{end}")
+        for name in STAGES[STAGES.index(start) : STAGES.index(end) + 1]:
+            self.data["stages"][name] = _blank_stage()
         self.data["error"] = None
+        nxt = self.next_pending()
+        self.data["stage"] = nxt or STAGES[-1]
+        self.data["status"] = "pending" if nxt else "done"
         self.save()
 
     def checkpoint_path(self, name: str) -> Path:
@@ -163,46 +161,3 @@ class JobState:
         if not path.is_file():
             return default
         return json.loads(path.read_text(encoding="utf-8"))
-
-    def summary_lines(self) -> list[str]:
-        status = str(self.data.get("status") or "?")
-        lines = [
-            f"work     {self.work}",
-            f"status   {status}",
-            f"stage    {self.data.get('stage')}",
-            f"updated  {self.data.get('updated_at')}",
-            "stages:",
-        ]
-        for name in STAGES:
-            st = self.data["stages"].get(name, {})
-            detail = st.get("detail") or {}
-            extra = ""
-            if detail:
-                bits = []
-                for k in (
-                    "segments",
-                    "total",
-                    "done_batches",
-                    "audio_ok",
-                    "missing",
-                    "out",
-                    "progress",
-                    "cues",
-                    "overflow",
-                    "duration",
-                    "size_mb",
-                ):
-                    if k in detail:
-                        bits.append(f"{k}={detail[k]}")
-                if bits:
-                    extra = "  " + ", ".join(bits)
-            lines.append(
-                format_status_line(name, str(st.get("status", "?")), extra)
-            )
-        err = self.data.get("error")
-        if err:
-            lines.append(f"error    {err.get('message')}")
-            if err.get("retryable"):
-                lines.append("retryable yes")
-        lines.append(f"resume   {self.data.get('resume_hint')}")
-        return lines

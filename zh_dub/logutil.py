@@ -5,18 +5,7 @@ import sys
 from datetime import datetime
 from typing import Any
 
-# Main pipeline order for [n/N] badges (matches state.STAGES).
-PIPELINE_STAGES: list[str] = [
-    "download",
-    "prepare_video",
-    "transcribe",
-    "prepare_cues",
-    "merge",
-    "translate",
-    "tts",
-    "narration",
-    "compose",
-]
+from .state import STAGES
 
 # Friendly labels shown in stage banners.
 STAGE_LABELS: dict[str, str] = {
@@ -27,14 +16,9 @@ STAGE_LABELS: dict[str, str] = {
     "job": "任务",
     "status": "状态",
     "clean": "清理",
-    "download": "下载视频",
-    "download-video": "下载视频",
-    "download-subs": "下载字幕",
-    "prepare_video": "准备视频",
-    "prepare-video": "准备视频",
+    "download": "下载与切源",
     "transcribe": "本地转录",
-    "prepare_cues": "解析字幕",
-    "merge": "断句合并",
+    "segment": "断句分段",
     "translate": "中文翻译",
     "tts": "语音合成",
     "narration": "旁白时间线",
@@ -42,7 +26,6 @@ STAGE_LABELS: dict[str, str] = {
     "playlist": "展开播放列表",
     "batch": "批量任务",
     "batch-item": "批量条目",
-    "export": "导出成片",
 }
 
 
@@ -112,17 +95,9 @@ def _tag_time() -> str:
 
 def _stage_index(name: str) -> tuple[int, int] | None:
     key = name.strip()
-    # normalize aliases
-    aliases = {
-        "prepare-video": "prepare_video",
-        "prepare-cues": "prepare_cues",
-        "download-video": "download",
-        "download-subs": "download",
-    }
-    key = aliases.get(key, key)
-    if key not in PIPELINE_STAGES:
+    if key not in STAGES:
         return None
-    return PIPELINE_STAGES.index(key) + 1, len(PIPELINE_STAGES)
+    return STAGES.index(key) + 1, len(STAGES)
 
 
 def _stage_badge(name: str, index: int | None = None, total: int | None = None) -> str:
@@ -153,10 +128,6 @@ def ok(msg: str) -> None:
 
 def warn(msg: str) -> None:
     log(f"{yellow('WARN')}  {msg}")
-
-
-def error(msg: str) -> None:
-    log(f"{red('ERROR')} {msg}")
 
 
 def skip(msg: str) -> None:

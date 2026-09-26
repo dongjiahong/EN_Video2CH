@@ -1,32 +1,15 @@
+"""English subtitle parsing + sentence-aware packing into TTS-sized segments."""
+
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+
+from .segments import Segment
 
 TIME_RE = re.compile(
     r"(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})"
 )
-NUM_LINE_RE = re.compile(r"(?m)^\s*(\d+)\.\s*(.+?)\s*$")
-
-
-@dataclass
-class Segment:
-    idx: int
-    start: float
-    end: float
-    en: str
-    zh: str = ""
-    rate_pct: int = 0
-    audio: str = ""
-    tts_dur: float = 0.0
-    fitted: bool = False
-    note: str = ""
-
-    @property
-    def slot(self) -> float:
-        return max(0.05, self.end - self.start)
 
 
 def ts_to_seconds(ts: str) -> float:
@@ -36,16 +19,6 @@ def ts_to_seconds(ts: str) -> float:
     frac = float(f"0.{ms[0]}") if ms else 0.0
     return int(hh) * 3600 + int(mm) * 60 + int(ss) + frac
 
-
-def seconds_to_ts(sec: float, srt: bool = False) -> str:
-    if sec < 0:
-        sec = 0.0
-    ms = int(round(sec * 1000))
-    h, ms = divmod(ms, 3600_000)
-    m, ms = divmod(ms, 60_000)
-    s, ms = divmod(ms, 1000)
-    sep = "," if srt else "."
-    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
 
 
 def clean_caption_text(raw: str) -> str:
@@ -86,29 +59,6 @@ def parse_srt(path: Path) -> list[tuple[float, float, str]]:
     return cues
 
 
-def resolve_subtitle(
-    work: Path, explicit: str | None = None, prefer: list[str] | None = None
-) -> Path:
-    """Pick the local subtitle file. Prefer explicit path, then the names given
-    in ``prefer`` (or the default order), stopping at the first existing file."""
-    if explicit:
-        p = Path(explicit)
-        if not p.is_file():
-            raise FileNotFoundError(f"subtitle not found: {p}")
-        return p
-    names = prefer or ("asr.srt", "source.srt", "source.en.srt")
-    for name in names:
-        p = work / name
-        if p.is_file():
-            return p
-    raise FileNotFoundError(
-        f"missing subtitle in {work} (expected one of: {', '.join(names)})"
-    )
-
-
-def load_cues(path: Path) -> list[tuple[float, float, str]]:
-    return parse_srt(path)
-
 
 def _window_units(
     units: list[tuple[float, float, str]], t0: float, t1: float
@@ -131,7 +81,7 @@ def build_segments(
 ) -> list[Segment]:
     """Build TTS segments from a subtitle file (SRT with real punctuation)."""
     end = 1e12 if t1 is None or t1 <= 0 else t1
-    cues = _window_units(load_cues(path), t0, end)
+    cues = _window_units(parse_srt(path), t0, end)
     return merge_cues(
         cues,
         target_len=3.5,
@@ -487,121 +437,3 @@ def merge_cues(
         s.idx = i
     return fixed
 
-
-def drop_fillers(text: str) -> str:
-    out = re.sub(r"\b(um+|uh+|you know|i mean|okay|ok)\b", " ", text, flags=re.I)
-    return re.sub(r"\s+", " ", out).strip(" ,")
-
-
-_PUNCT_ONLY_RE = re.compile(r"[A-Za-z0-9]|[\u4e00-\u9fff]|[\uff10-\uff19\uff21-\uff3a\uff41-\uff5a]")
-
-
-def is_punct_only(text: str) -> bool:
-    """True when text has no readable content, only punctuation/whitespace."""
-    t = (text or "").strip()
-    return bool(t) and not _PUNCT_ONLY_RE.search(t)
-
-
-def parse_numbered_zh(text: str, expected: int) -> dict[int, str]:
-    found: dict[int, str] = {}
-    for m in NUM_LINE_RE.finditer(text.replace("\r\n", "\n")):
-        n = int(m.group(1))
-        zh = m.group(2).strip()
-        zh = re.sub(r"^[\"'“”]+|[\"'“”]+$", "", zh).strip()
-        if 1 <= n <= expected and zh:
-            found[n] = zh
-    return found
-
-
-def save_segments(segs: Iterable[Segment], path: Path) -> None:
-    path.write_text(
-        __import__("json").dumps([asdict(s) for s in segs], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def load_segments(path: Path) -> list[Segment]:
-    data = __import__("json").loads(path.read_text(encoding="utf-8"))
-    return [Segment(**row) for row in data]
-
-
-def write_srt(segs: list[Segment], path: Path, field: str = "zh") -> None:
-    lines: list[str] = []
-    n = 1
-    for seg in segs:
-        text = getattr(seg, field).strip()
-        if not text or is_punct_only(text):
-            continue
-        lines.append(str(n))
-        lines.append(
-            f"{seconds_to_ts(seg.start, True)} --> {seconds_to_ts(seg.end, True)}"
-        )
-        lines.append(text)
-        lines.append("")
-        n += 1
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def _wrap_zh_line(text: str, max_chars: int = 32) -> str:
-    """Hard-wrap Chinese subtitle text for ASS (\\N). Prefer breaks after punct."""
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text or len(text) <= max_chars:
-        return text
-
-    prefer = set("，。！？；：、,.!?;: ")
-    lines: list[str] = []
-    rest = text
-    while rest:
-        if len(rest) <= max_chars:
-            lines.append(rest)
-            break
-        window = rest[: max_chars + 1]
-        cut = -1
-        # look for punctuation near the end of the window
-        for i in range(max_chars, max(max_chars // 2, 0) - 1, -1):
-            if window[i - 1] in prefer:
-                cut = i
-                break
-        if cut < 0:
-            cut = max_chars
-        piece = rest[:cut].strip()
-        if piece:
-            lines.append(piece)
-        rest = rest[cut:].lstrip()
-    return "\\N".join(lines)
-
-
-def write_zh_ass(segs: list[Segment], path: Path, *, max_chars: int = 32) -> None:
-    header = """[Script Info]
-ScriptType: v4.00+
-PlayResX: 640
-PlayResY: 360
-WrapStyle: 2
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ZH,PingFang SC,16,&H0000F0FF,&H000000FF,&H00101010,&H00000000,0,0,0,0,100,100,0,0,1,1.6,0,2,20,20,24,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-
-    def _ass_ts(sec: float) -> str:
-        if sec < 0:
-            sec = 0.0
-        cs = int(round(sec * 100))
-        h, cs = divmod(cs, 360000)
-        m, cs = divmod(cs, 6000)
-        s, cs = divmod(cs, 100)
-        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-    events: list[str] = []
-    for seg in segs:
-        zh = (seg.zh or "").replace("\n", " ").replace("{", "(").replace("}", ")").strip()
-        if not zh or is_punct_only(zh):
-            continue
-        zh = _wrap_zh_line(zh, max_chars=max_chars)
-        st, et = _ass_ts(seg.start), _ass_ts(seg.end)
-        events.append(f"Dialogue: 0,{st},{et},ZH,,0,0,0,,{zh}")
-    path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")

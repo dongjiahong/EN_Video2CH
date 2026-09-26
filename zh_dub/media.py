@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import os
+import shutil
 import subprocess
-import wave
 from pathlib import Path
 
 from .config import Settings
-from .logutil import detail, highlight, info, ok, skip, warn
+from .logutil import detail, highlight, info, ok, warn
 
 
 def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -114,11 +113,6 @@ def ffprobe_fps(settings: Settings, path: Path) -> float:
     return 30.0
 
 
-def wav_duration(path: Path) -> float:
-    with wave.open(str(path), "rb") as w:
-        return w.getnframes() / float(w.getframerate())
-
-
 def yt_dlp_format(quality: str) -> str:
     if quality == "best":
         return "bv*+ba/b"
@@ -135,10 +129,6 @@ def download_video(settings: Settings, url: str, work: Path) -> dict:
     fmt = yt_dlp_format(settings.quality)
     env = with_proxy_env(settings.proxy)
     full = work / "source_full.mp4"
-    if full.is_file() or (work / "source.mp4").is_file():
-        skip("本地视频已存在，跳过下载")
-        return {"skipped": True, "file": str(full if full.is_file() else work / "source.mp4")}
-
     info(f"yt-dlp format={fmt}")
     run_cmd(
         [
@@ -160,22 +150,7 @@ def download_video(settings: Settings, url: str, work: Path) -> dict:
     wh = ffprobe_wh(settings, full)
     size_mb = full.stat().st_size / (1024 * 1024)
     highlight(f"视频已下载  {wh or '?'}  {size_mb:.1f}MB")
-    return {"skipped": False, "file": str(full), "res": wh, "size_mb": round(size_mb, 1)}
-
-
-def resolve_video_id(settings: Settings, url: str) -> str:
-    env = with_proxy_env(settings.proxy)
-    cp = subprocess.run(
-        [settings.yt_dlp, "--print", "%(id)s", "--skip-download", url],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    vid = (cp.stdout or "").strip().splitlines()[0].strip()
-    if not vid:
-        raise RuntimeError("failed to resolve youtube id")
-    return vid
+    return {"res": wh, "size_mb": round(size_mb, 1)}
 
 
 def fetch_video_meta(settings: Settings, url: str) -> dict:
@@ -217,110 +192,35 @@ def fetch_video_meta(settings: Settings, url: str) -> dict:
     return {"id": vid, "title_en": title, "duration": duration}
 
 
+
+
 def prepare_source_video(settings: Settings, work: Path, end: float) -> dict:
+    """source_full.mp4 -> source.mp4: hardlink for full length, re-encode cut for preview."""
     full = work / "source_full.mp4"
     src = work / "source.mp4"
-    if not full.is_file() and not src.is_file():
-        raise RuntimeError(f"missing source.mp4 / source_full.mp4 in {work}")
+    if not full.is_file():
+        raise RuntimeError(f"missing source_full.mp4 in {work}")
+    src.unlink(missing_ok=True)
 
     if end <= 0:
-        if full.is_file():
-            need = True
-            if src.is_file():
-                if src.stat().st_size >= full.stat().st_size * 0.9:
-                    need = False
-            if need:
-                info("全长拷贝 source_full.mp4 -> source.mp4")
-                run_cmd(
-                    [settings.ffmpeg, "-y", "-i", str(full), "-c", "copy", str(src)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                skip("source.mp4 已是全长")
-        ok("视频准备完成  mode=full")
-        return {"mode": "full", "file": str(src)}
+        try:
+            os.link(full, src)
+            how = "link"
+        except OSError:
+            shutil.copy2(full, src)
+            how = "copy"
+        ok(f"视频准备完成  mode=full ({how})")
+        return {"mode": "full", "end": 0.0}
 
-    if not full.is_file():
-        raise RuntimeError("preview cut requires source_full.mp4")
     info(f"预览裁剪 0..{end}s -> source.mp4")
     run_cmd(
         [
-            settings.ffmpeg,
-            "-y",
-            "-ss",
-            "0",
-            "-t",
-            str(end),
-            "-i",
-            str(full),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            str(src),
+            settings.ffmpeg, "-y", "-ss", "0", "-t", str(end), "-i", str(full),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "128k", str(src),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     ok(f"视频准备完成  mode=preview end={end}")
-    return {"mode": "preview", "end": end, "file": str(src)}
-
-
-def mp3_to_wav(settings: Settings, mp3: Path, wav: Path) -> None:
-    subprocess.run(
-        [settings.ffmpeg, "-y", "-i", str(mp3), "-ac", "1", "-ar", "24000", str(wav)],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-async def synthesize_mp3_async(
-    text: str,
-    out_mp3: Path,
-    voice: str,
-    rate_pct: int,
-    *,
-    retries: int = 3,
-) -> None:
-    """Synthesize via edge-tts library (no CLI subprocess)."""
-    import edge_tts
-
-    rate = f"{rate_pct:+d}%"
-    out_mp3.parent.mkdir(parents=True, exist_ok=True)
-    clear_proxy_env()
-    last_err: BaseException | None = None
-    for attempt in range(max(1, retries)):
-        try:
-            if out_mp3.is_file():
-                out_mp3.unlink()
-            communicate = edge_tts.Communicate(text, voice, rate=rate)
-            await communicate.save(str(out_mp3))
-            if out_mp3.is_file() and out_mp3.stat().st_size >= 500:
-                return
-            last_err = RuntimeError(f"tts empty output: {out_mp3}")
-        except BaseException as e:  # noqa: BLE001
-            last_err = e
-        if attempt + 1 < retries:
-            await asyncio.sleep(1.2 * (attempt + 1))
-    raise RuntimeError(f"tts failed after {retries} tries: {last_err}")
-
-
-def synthesize_mp3(
-    settings: Settings, text: str, out_mp3: Path, voice: str, rate_pct: int
-) -> None:
-    """Sync wrapper; prefer synthesize_mp3_async inside async TTS pipeline."""
-    del settings  # library path; CLI binary kept on Settings for env/tool checks
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(synthesize_mp3_async(text, out_mp3, voice, rate_pct))
-        return
-    raise RuntimeError("synthesize_mp3() called inside running loop; use synthesize_mp3_async")
+    return {"mode": "preview", "end": float(end)}

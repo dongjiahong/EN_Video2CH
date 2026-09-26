@@ -13,7 +13,8 @@ DEFAULT_CONDA_PYTHON = Path.home() / "miniconda3/envs/python3/bin/python"
 
 
 def _load_dotenv_file(path: Path, *, override: bool = False) -> bool:
-    """Minimal .env loader (works without python-dotenv)."""
+    """Minimal .env loader: runs before re-exec, when the interpreter may lack
+    third-party packages such as python-dotenv."""
     if not path.is_file():
         return False
     try:
@@ -48,12 +49,6 @@ def load_env(project_root: Path | None = None) -> list[Path]:
         Path.cwd() / ".env",
         Path.home() / ".config" / "youtube-zh-dub" / ".env",
     ]
-    # also try python-dotenv if present (same semantics)
-    try:
-        from dotenv import load_dotenv as _dotenv_load
-    except ImportError:
-        _dotenv_load = None
-
     loaded: list[Path] = []
     seen: set[Path] = set()
     for p in candidates:
@@ -64,11 +59,6 @@ def load_env(project_root: Path | None = None) -> list[Path]:
         if rp in seen or not rp.is_file():
             continue
         seen.add(rp)
-        if _dotenv_load is not None:
-            _dotenv_load(rp, override=False)
-        else:
-            _load_dotenv_file(rp, override=False)
-        # always also run builtin to be safe if dotenv missing keys edge cases
         _load_dotenv_file(rp, override=False)
         loaded.append(rp)
     return loaded
@@ -76,6 +66,22 @@ def load_env(project_root: Path | None = None) -> list[Path]:
 
 def _expand(value: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(value.strip()))).resolve()
+
+
+def _project_path(raw: str, root: Path) -> Path:
+    p = Path(os.path.expanduser(raw.strip()))
+    return p.resolve() if p.is_absolute() else (root / p).resolve()
+
+
+def normalize_quality(raw: str) -> str:
+    q = (raw or "").strip().lower()
+    if q in {"720", "720p"}:
+        return "720"
+    if q in {"1080", "1080p"}:
+        return "1080"
+    if q in {"best", "max", "highest", "source"}:
+        return "best"
+    raise SystemExit("quality must be 720, 1080, or best")
 
 
 def _is_exec(path: Path) -> bool:
@@ -145,9 +151,7 @@ class Settings:
     yt_dlp: str
     ffmpeg: str
     ffprobe: str
-    edge_tts: str
     modelscope_base_url: str
-    subtitle_source: str
     parakeet_model: str
     parakeet_silence_gap: float
     parakeet_chunk_duration: float
@@ -168,24 +172,8 @@ class Settings:
     def load(cls, project_root: Path | None = None) -> "Settings":
         root = (project_root or ROOT).resolve()
         env_files = load_env(root)
-        workdir_raw = (os.getenv("WORKDIR") or str(root / "work")).strip()
-        workdir = Path(os.path.expanduser(workdir_raw))
-        if not workdir.is_absolute():
-            workdir = (root / workdir).resolve()
-
-        quality = (os.getenv("QUALITY") or "720").strip().lower()
-        if quality in {"720p"}:
-            quality = "720"
-        elif quality in {"1080p"}:
-            quality = "1080"
-        elif quality in {"max", "highest", "source"}:
-            quality = "best"
-        if quality not in {"720", "1080", "best"}:
-            raise SystemExit("QUALITY must be 720, 1080, or best")
-
-        subtitle_source = (os.getenv("SUBTITLE_SOURCE") or "asr").strip().lower()
-        if subtitle_source not in {"asr", "auto"}:
-            raise SystemExit("SUBTITLE_SOURCE must be asr or auto")
+        workdir = _project_path(os.getenv("WORKDIR") or "work", root)
+        quality = normalize_quality(os.getenv("QUALITY") or "720")
 
         parakeet_decoding = (os.getenv("PARAKEET_DECODING") or "greedy").strip().lower()
         if parakeet_decoding not in {"greedy", "beam"}:
@@ -203,24 +191,9 @@ class Settings:
             raise SystemExit(f"缺少 API_KEY / MODEL，请写在 {root / '.env'}")
 
         cover_raw = (os.getenv("COVER_IMAGE") or "").strip()
-        cover_image: Path | None = None
-        if cover_raw:
-            cover_path = Path(os.path.expanduser(cover_raw))
-            if not cover_path.is_absolute():
-                cover_path = (root / cover_path).resolve()
-            else:
-                cover_path = cover_path.resolve()
-            cover_image = cover_path
-
+        cover_image = _project_path(cover_raw, root) if cover_raw else None
         output_raw = (os.getenv("OUTPUT_DIR") or "").strip()
-        output_dir: Path | None = None
-        if output_raw:
-            output_path = Path(os.path.expanduser(output_raw))
-            if not output_path.is_absolute():
-                output_path = (root / output_path).resolve()
-            else:
-                output_path = output_path.resolve()
-            output_dir = output_path
+        output_dir = _project_path(output_raw, root) if output_raw else None
 
         return cls(
             root=root,
@@ -242,7 +215,6 @@ class Settings:
                 "ffprobe",
                 [Path("/opt/homebrew/opt/ffmpeg-full/bin/ffprobe")],
             ),
-            edge_tts=resolve_tool("EDGE_TTS", "edge-tts"),
             modelscope_base_url=(
                 os.getenv("MODELSCOPE_BASE_URL")
                 or "https://api-inference.modelscope.cn/v1"
@@ -257,7 +229,6 @@ class Settings:
             ),
             tts_concurrency=max(1, int(os.getenv("TTS_CONCURRENCY") or "2")),
             tts_max_rate=max(0, int(os.getenv("TTS_MAX_RATE") or "30")),
-            subtitle_source=subtitle_source,
             parakeet_model=(
                 os.getenv("PARAKEET_MODEL") or "mlx-community/parakeet-tdt-0.6b-v3"
             ).strip(),

@@ -1,0 +1,218 @@
+"""edge-tts synthesis with per-segment duration fitting and fingerprint cache."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import math
+import re
+from pathlib import Path
+from typing import Any, Callable
+
+from .config import Settings
+from .media import clear_proxy_env, ffprobe_duration
+from .segments import Segment, speakable
+
+MIN_MP3_BYTES = 500
+
+
+def compress_zh(text: str) -> list[str]:
+    cands = [text]
+    t = text
+    for a, b in [
+        ("我们", ""),
+        ("一个", ""),
+        ("这个", ""),
+        ("那个", ""),
+        ("然后", ""),
+        ("显然", ""),
+        ("其实", ""),
+        ("你看", ""),
+        ("我会", "我"),
+        ("进行", ""),
+        ("的话", ""),
+        ("一下", ""),
+    ]:
+        t2 = t.replace(a, b)
+        if t2 != t:
+            t = re.sub(r"[，。\s]{2,}", "，", t2).strip("，。 ")
+            if t and t not in cands:
+                cands.append(t)
+    compact = re.sub(r"[，。！？、\s]+", "，", text).strip("，")
+    if compact and compact not in cands:
+        cands.append(compact)
+    return cands
+
+
+def _needed_rate_pct(dur: float, slot: float, max_rate: int) -> int:
+    """Compute rate% so that dur/(1+rate/100) ~= slot."""
+    if dur <= 0 or slot <= 0:
+        return 0
+    need = dur / slot - 1.0
+    if need <= 0:
+        return 0
+    # small headroom for non-linear edge-tts rate
+    pct = int(math.ceil(need * 100 * 1.05))
+    return max(1, min(max_rate, pct))
+
+
+def tts_key(text: str, voice: str, max_rate: int) -> str:
+    raw = f"{text.strip()}|{voice}|{max_rate}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def audio_path(audio_dir: Path, seg: Segment) -> Path:
+    return audio_dir / f"seg_{seg.idx:04d}.mp3"
+
+
+def is_cached(seg: Segment, audio_dir: Path, voice: str, max_rate: int) -> bool:
+    mp3 = audio_path(audio_dir, seg)
+    return (
+        bool(seg.tts_key)
+        and seg.tts_key == tts_key(seg.zh, voice, max_rate)
+        and mp3.is_file()
+        and mp3.stat().st_size >= MIN_MP3_BYTES
+    )
+
+
+async def synthesize_mp3_async(
+    text: str, out_mp3: Path, voice: str, rate_pct: int, *, retries: int = 3
+) -> None:
+    import edge_tts
+
+    rate = f"{rate_pct:+d}%"
+    out_mp3.parent.mkdir(parents=True, exist_ok=True)
+    last_err: BaseException | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            out_mp3.unlink(missing_ok=True)
+            await edge_tts.Communicate(text, voice, rate=rate).save(str(out_mp3))
+            if out_mp3.is_file() and out_mp3.stat().st_size >= MIN_MP3_BYTES:
+                return
+            last_err = RuntimeError(f"tts empty output: {out_mp3}")
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+        if attempt + 1 < retries:
+            await asyncio.sleep(1.2 * (attempt + 1))
+    raise RuntimeError(f"tts failed after {retries} tries: {last_err}")
+
+
+def _apply_result(
+    seg: Segment, mp3: Path, *, dur: float, rate: int, text: str, original: str, key: str
+) -> None:
+    seg.zh = text
+    seg.rate_pct = rate
+    seg.tts_dur = dur
+    seg.audio = str(mp3)
+    seg.tts_key = key
+    seg.fitted = dur <= seg.slot * 1.15
+    if not seg.fitted:
+        seg.note = "overflow"
+    else:
+        seg.note = "ok" if text == original else "compressed"
+
+
+async def fit_segment_async(
+    settings: Settings, seg: Segment, audio_dir: Path, voice: str
+) -> Segment:
+    """
+    Typical path: 1 TTS (rate=0). If over slot: 1 more TTS at computed rate.
+    Only if still overflow after max rate: try compressed zh candidates.
+    """
+    max_rate = settings.tts_max_rate
+    text = seg.zh.strip()
+    if not speakable(text):
+        seg.note = "empty_zh"
+        seg.fitted = True
+        seg.audio = ""
+        seg.tts_key = ""
+        return seg
+    if is_cached(seg, audio_dir, voice, max_rate):
+        seg.note = "cached"
+        return seg
+
+    mp3 = audio_path(audio_dir, seg)
+    slot = seg.slot
+    best: tuple[float, int, str, bytes] | None = None
+
+    async def synth(cand: str, rate: int) -> float:
+        nonlocal best
+        await synthesize_mp3_async(cand, mp3, voice, rate)
+        dur = await asyncio.to_thread(ffprobe_duration, settings, mp3)
+        if best is None or dur < best[0]:
+            best = (dur, rate, cand, mp3.read_bytes())
+        return dur
+
+    def finish(dur: float, rate: int, cand: str) -> Segment:
+        # key covers the text actually spoken, so compressed text stays cached
+        _apply_result(
+            seg, mp3, dur=dur, rate=rate, text=cand, original=text,
+            key=tts_key(cand, voice, max_rate),
+        )
+        return seg
+
+    for cand in compress_zh(text):
+        try:
+            dur0 = await synth(cand, 0)
+        except Exception as e:  # noqa: BLE001
+            seg.note = f"tts_fail:{str(e)[-200:]}"
+            continue
+        if dur0 <= slot * 1.02:
+            return finish(dur0, 0, cand)
+        rate = _needed_rate_pct(dur0, slot, max_rate)
+        try:
+            dur = await synth(cand, rate)
+        except Exception:  # noqa: BLE001
+            continue
+        if dur <= slot * 1.15:
+            return finish(dur, rate, cand)
+
+    if best is not None:
+        dur, rate, cand, data = best
+        mp3.write_bytes(data)
+        return finish(dur, rate, cand)
+    seg.audio = ""
+    seg.tts_key = ""
+    return seg
+
+
+def fit_segments(
+    settings: Settings,
+    segs: list[Segment],
+    audio_dir: Path,
+    voice: str,
+    on_progress: Callable[[int, int, Segment], None] | None = None,
+) -> None:
+    clear_proxy_env()
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    async def main() -> None:
+        sem = asyncio.Semaphore(max(1, settings.tts_concurrency))
+        done = 0
+
+        async def one(seg: Segment) -> None:
+            nonlocal done
+            async with sem:
+                await fit_segment_async(settings, seg, audio_dir, voice)
+            done += 1
+            if on_progress:
+                on_progress(done, len(segs), seg)
+
+        await asyncio.gather(*(one(s) for s in segs))
+
+    asyncio.run(main())
+
+
+def validate_tts(
+    segs: list[Segment], audio_dir: Path, voice: str, max_rate: int
+) -> dict[str, Any]:
+    need = [s for s in segs if speakable(s.zh)]
+    missing = [s.idx for s in need if not is_cached(s, audio_dir, voice, max_rate)]
+    return {
+        "segments": len(segs),
+        "need": len(need),
+        "audio_ok": len(need) - len(missing),
+        "audio_missing": missing,
+        "overflow": sum(1 for s in segs if s.note == "overflow"),
+        "pass": not missing,
+    }

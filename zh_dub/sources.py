@@ -8,8 +8,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .config import Settings
-from .logutil import detail, highlight, info, warn
-from .media import with_proxy_env
+from .logutil import detail, highlight, info, stage, stage_done, warn
+from .media import fetch_video_meta, with_proxy_env
 
 
 WATCH_TMPL = "https://www.youtube.com/watch?v={id}"
@@ -160,9 +160,24 @@ def resolve_output_dir(settings: Settings, cli_output: str | None) -> Path | Non
     raw = (cli_output or "").strip()
     if raw:
         p = Path(raw).expanduser()
+        return p.resolve() if p.is_absolute() else (settings.root / p).resolve()
+    return settings.output_dir
+
+
+def resolve_work_dir(settings: Settings, work: str | None, url: str | None) -> Path:
+    """Explicit --work wins; otherwise derive work/<youtube_id> from the URL."""
+    if work:
+        p = Path(work)
         if not p.is_absolute():
             p = (settings.root / p).resolve()
-        else:
-            p = p.resolve()
+        p.mkdir(parents=True, exist_ok=True)
         return p
-    return settings.output_dir
+    if not url:
+        raise SystemExit("Need --url or --work")
+    stage("resolve-id", url)
+    vid = str(fetch_video_meta(settings, url)["id"])
+    p = (settings.workdir / vid).resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    highlight(f"视频 ID={vid}")
+    stage_done("resolve-id", f"id={vid} work={p}")
+    return p

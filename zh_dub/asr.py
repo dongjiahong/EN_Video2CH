@@ -15,10 +15,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from .captions import seconds_to_ts
 from .config import Settings
 from .logutil import highlight, info, warn
 from .media import run_cmd
+from .segments import seconds_to_ts
 
 ASR_WAV = "_asr.wav"
 MIN_CUE_SEC = 0.05
