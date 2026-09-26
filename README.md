@@ -55,10 +55,11 @@ python job_run.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --output ./ou
 ### 4. 智能 TTS 配音（edge-tts）
 
 - 每句按英文时间槽（slot）适配时长：先原始语速合成，**超时自动加速**（最高 `TTS_MAX_RATE`%），仍超则用压缩候选文本。
-- 并发合成（`TTS_CONCURRENCY`，默认 2，可调 8~16）。
+- 并发合成（`TTS_CONCURRENCY`，默认 2，可调 8~16）。单次合成默认 **45s 超时**（`TTS_TIMEOUT`），超时先再试 1 次，仍挂则跳过该句。
+- 其它句子继续跑，不会因为最后几句 websocket 挂死把整阶段卡住。全部跑完后若仍有缺句，**tts 阶段失败、本视频停**（批量记入 `video_failed.txt`，继续下一条）；回头 `--from tts --to tts` 只补缺句。
 - 每句记录指纹 `tts_key = sha1(中文 | 音色 | max_rate)`：**改了中文或换了音色自动重配对应的句子**，不再需要手动删 mp3。
 - **纯标点句自动跳过**：`zh` 只剩 `。？！` 等标点的段不发 TTS、字幕也不显示，不再因此卡住整条视频。
-- 结束后校验：所有有内容的中文段必须有音频，缺句提示续跑补录。
+- 屏幕只打一行进度 `TTS  210/400  52%`；每句详情写到 `LOG_DIR/YYYY-MM-DD.log`。
 
 ### 5. 旁白时间轴
 
@@ -213,6 +214,8 @@ python -m pytest tests -q
 | `COVER_IMAGE` | 空 | 片头封面图（1 秒），相对项目根或绝对路径 |
 | `TTS_CONCURRENCY` | `2` | TTS 并发（edge-tts 易限流，可调 2~16） |
 | `TTS_MAX_RATE` | `30` | TTS 最大加速百分比（0~100） |
+| `TTS_TIMEOUT` | `45` | 单次 edge-tts 超时秒数；超时再试 1 次，仍失败则该句缺音频 |
+| `LOG_DIR` | `./logs` | 详情日志目录，按天切分 `YYYY-MM-DD.log` |
 | `TRANSLATE_BATCH_SIZE` | `100` | 翻译批大小（改它不影响已有译文缓存） |
 | `TRANSLATE_MAX_RETRIES` | `5` | 单批最大重试 |
 | `TRANSLATE_CONCURRENCY` | `2` | 主翻译 batch 并发（补译在主翻全部结束后串行） |
@@ -489,7 +492,9 @@ TTS 机制小结：
 - 每句指纹 `tts_key = sha1(zh | voice | max_rate)`，`tts_dur` / `rate_pct` / `note` 写回 `segments.json`。
 - **纯标点句不发 TTS、字幕不显示、校验不要求**，不会因为一句 `。` 卡住整条。
 - `TTS_MAX_RATE` 改变也会让指纹失效（加速上限不同，适配结果可能不同）。
-- 结束后校验：有内容的中文段必须都有音频，否则 `tts` 标记 failed 并提示补缺。
+- 单次合成超时（默认 45s）会再试 1 次；仍失败则该句记 `tts_timeout`，其它句继续。全部结束后若仍有缺句，tts 阶段失败。
+- 超过 20s 没完成的句子会在屏幕打心跳 `TTS 等待 idx=0408 已 45s`。
+- 结束后校验：有内容的中文段必须都有音频，否则 `tts` 标记 failed；续跑只补缺句。
 
 ### 11. 成片合成 / 封面 / 字幕
 
@@ -535,6 +540,7 @@ python job_run.py --work work/VIDEO_ID --clean --yes  # 真正删除
 | `work/<id>/en_merged.srt` | 英文分段字幕 |
 | `work/<id>/checkpoints/translations.json` | 英→中翻译缓存 |
 | `video_failed.txt` | 批量失败记录（`[时间戳] URL<TAB>错误`，追加写） |
+| `logs/YYYY-MM-DD.log` | 当天详情日志（每句 TTS、翻译 batch、ffmpeg 命令）；屏幕只打阶段进度 |
 
 ---
 
@@ -549,6 +555,7 @@ python job_run.py --work work/VIDEO_ID --clean --yes  # 真正删除
 | 日志提示「仍有 N 条未译」 | 这些句子不配音、不出字幕；再跑一次只会重发这 N 条，或删 `checkpoints/translations.json` 全量重翻 |
 | 翻译太慢 | `.env` 调大 `TRANSLATE_CONCURRENCY`（如 3~4），注意 API 限流 |
 | TTS 太慢 | `.env` 调大 `TTS_CONCURRENCY`（如 8），再 `--from tts --to tts` |
+| TTS 卡在最后几句不动 | 已加超时+心跳；仍缺句则本视频失败。看 `logs/当天.log`，再 `--from tts --to tts` 只补缺句 |
 | 缺音频 / TTS 未完成 | `python job_run.py --work DIR --from tts --to tts`（纯标点句会自动跳过） |
 | 换音色仍是旧声 | 正常路径下会自动重配；若手动改过音频文件，删掉 `audio/seg_*.mp3` 后 `--from tts` |
 | 中文只剩标点导致 TTS 失败（No audio received） | 纯标点段自动跳过（不发 TTS、字幕不显示），重跑 TTS 即可 |
@@ -582,7 +589,7 @@ zh_dub/
   segmenter.py           # SRT 解析 + 断句合并（句子级打包）
   asr.py                 # parakeet-mlx 本地转录 → asr.srt
   translate.py           # ModelScope 批量翻译 + en→zh 缓存 + 多轮补译
-  tts.py                 # edge-tts 并发合成 + 时长适配 + 指纹缓存 + 完整性校验
+  tts.py                 # edge-tts 并发合成 + 超时重试 + 时长适配 + 指纹缓存 + 完整性校验
   narration.py           # 各句音频按时间贴成整片旁白 wav
   compose.py             # 烧字幕 + 旁白混音 + 可选片头
   clean.py               # 清理 work 中间件（保留成片）
@@ -590,6 +597,6 @@ zh_dub/
   sources.py             # URL 判断、播放列表展开、--limit 窗口、work/output 目录解析
   export.py              # 成品导出：中文标题 + 序号命名
   config.py              # .env 加载、工具路径探测、Settings
-  logutil.py             # 日志/进度条/阶段横幅
-tests/                   # pytest：断句、limit、导出命名、翻译缓存、TTS 指纹、Runner 调度
+  logutil.py             # 屏幕进度 + LOG_DIR 按天详情日志
+tests/                   # pytest：断句、limit、导出命名、翻译缓存、TTS 超时、Runner 调度
 ```

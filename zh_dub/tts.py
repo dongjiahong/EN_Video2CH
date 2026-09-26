@@ -6,14 +6,18 @@ import asyncio
 import hashlib
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import Settings
+from .logutil import warn
 from .media import clear_proxy_env, ffprobe_duration
 from .segments import Segment, speakable
 
 MIN_MP3_BYTES = 500
+HEARTBEAT_SEC = 20.0
+OnProgress = Callable[..., None]
 
 
 def compress_zh(text: str) -> list[str]:
@@ -75,26 +79,83 @@ def is_cached(seg: Segment, audio_dir: Path, voice: str, max_rate: int) -> bool:
     )
 
 
-async def synthesize_mp3_async(
-    text: str, out_mp3: Path, voice: str, rate_pct: int, *, retries: int = 3
-) -> None:
+def _fail_note(err: BaseException) -> str:
+    if isinstance(err, (TimeoutError, asyncio.TimeoutError)):
+        return f"tts_timeout:{str(err)[-200:]}"
+    return f"tts_fail:{str(err)[-200:]}"
+
+
+def _discard(task: asyncio.Task) -> None:
+    """Swallow result of a cancelled/abandoned synth so it cannot hang gather."""
+    try:
+        if task.cancelled():
+            return
+        task.exception()
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
+
+
+def _run_async(coro):
+    """Like asyncio.run, but do not wait forever for abandoned synth tasks."""
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        leftover = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for t in leftover:
+            t.cancel()
+            t.add_done_callback(_discard)
+        if leftover:
+            loop.run_until_complete(asyncio.wait(leftover, timeout=0.5))
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+async def _edge_save(text: str, out_mp3: Path, voice: str, rate_pct: int) -> None:
     import edge_tts
 
-    rate = f"{rate_pct:+d}%"
+    await edge_tts.Communicate(text, voice, rate=f"{rate_pct:+d}%").save(str(out_mp3))
+
+
+async def synthesize_mp3_async(
+    text: str,
+    out_mp3: Path,
+    voice: str,
+    rate_pct: int,
+    *,
+    retries: int = 2,
+    timeout: float = 45.0,
+) -> None:
+    """One synth: timeout, then one retry. retries=2 means original + 1 extra try.
+
+    Uses asyncio.wait rather than wait_for: wait_for waits for cancellation
+    to finish, which is exactly what a hung edge-tts websocket will not do.
+    """
     out_mp3.parent.mkdir(parents=True, exist_ok=True)
     last_err: BaseException | None = None
-    for attempt in range(max(1, retries)):
-        try:
-            out_mp3.unlink(missing_ok=True)
-            await edge_tts.Communicate(text, voice, rate=rate).save(str(out_mp3))
-            if out_mp3.is_file() and out_mp3.stat().st_size >= MIN_MP3_BYTES:
-                return
-            last_err = RuntimeError(f"tts empty output: {out_mp3}")
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-        if attempt + 1 < retries:
+    attempts = max(1, retries)
+    for attempt in range(attempts):
+        out_mp3.unlink(missing_ok=True)
+        task = asyncio.create_task(_edge_save(text, out_mp3, voice, rate_pct))
+        done, pending = await asyncio.wait({task}, timeout=timeout)
+        if pending:
+            task.cancel()
+            task.add_done_callback(_discard)
+            last_err = TimeoutError(f"tts timeout after {timeout:.0f}s")
+        else:
+            exc = task.exception()
+            if exc is None:
+                if out_mp3.is_file() and out_mp3.stat().st_size >= MIN_MP3_BYTES:
+                    return
+                last_err = RuntimeError(f"tts empty output: {out_mp3}")
+            else:
+                last_err = exc
+        if attempt + 1 < attempts:
             await asyncio.sleep(1.2 * (attempt + 1))
-    raise RuntimeError(f"tts failed after {retries} tries: {last_err}")
+    if isinstance(last_err, TimeoutError):
+        raise last_err
+    raise RuntimeError(f"tts failed after {attempts} tries: {last_err}")
 
 
 def _apply_result(
@@ -113,13 +174,20 @@ def _apply_result(
 
 
 async def fit_segment_async(
-    settings: Settings, seg: Segment, audio_dir: Path, voice: str
+    settings: Settings,
+    seg: Segment,
+    audio_dir: Path,
+    voice: str,
+    *,
+    timeout: float | None = None,
 ) -> Segment:
     """
     Typical path: 1 TTS (rate=0). If over slot: 1 more TTS at computed rate.
     Only if still overflow after max rate: try compressed zh candidates.
+    Network timeout/fail: retry once inside synthesize, then skip this sentence.
     """
     max_rate = settings.tts_max_rate
+    limit = float(timeout if timeout is not None else getattr(settings, "tts_timeout", 45.0) or 45.0)
     text = seg.zh.strip()
     if not speakable(text):
         seg.note = "empty_zh"
@@ -137,26 +205,33 @@ async def fit_segment_async(
 
     async def synth(cand: str, rate: int) -> float:
         nonlocal best
-        await synthesize_mp3_async(cand, mp3, voice, rate)
+        await synthesize_mp3_async(cand, mp3, voice, rate, timeout=limit)
         dur = await asyncio.to_thread(ffprobe_duration, settings, mp3)
         if best is None or dur < best[0]:
             best = (dur, rate, cand, mp3.read_bytes())
         return dur
 
     def finish(dur: float, rate: int, cand: str) -> Segment:
-        # key covers the text actually spoken, so compressed text stays cached
         _apply_result(
             seg, mp3, dur=dur, rate=rate, text=cand, original=text,
             key=tts_key(cand, voice, max_rate),
         )
         return seg
 
+    def skip(err: BaseException) -> Segment:
+        mp3.unlink(missing_ok=True)
+        seg.note = _fail_note(err)
+        seg.audio = ""
+        seg.tts_key = ""
+        return seg
+
     for cand in compress_zh(text):
         try:
             dur0 = await synth(cand, 0)
         except Exception as e:  # noqa: BLE001
-            seg.note = f"tts_fail:{str(e)[-200:]}"
-            continue
+            if best is None:
+                return skip(e)
+            break
         if dur0 <= slot * 1.02:
             return finish(dur0, 0, cand)
         rate = _needed_rate_pct(dur0, slot, max_rate)
@@ -181,26 +256,61 @@ def fit_segments(
     segs: list[Segment],
     audio_dir: Path,
     voice: str,
-    on_progress: Callable[[int, int, Segment], None] | None = None,
+    on_progress: OnProgress | None = None,
 ) -> None:
     clear_proxy_env()
     audio_dir.mkdir(parents=True, exist_ok=True)
+    timeout = float(getattr(settings, "tts_timeout", 45.0) or 45.0)
 
     async def main() -> None:
         sem = asyncio.Semaphore(max(1, settings.tts_concurrency))
         done = 0
+        inflight: dict[int, float] = {}
+        stop = asyncio.Event()
 
         async def one(seg: Segment) -> None:
             nonlocal done
             async with sem:
-                await fit_segment_async(settings, seg, audio_dir, voice)
+                inflight[seg.idx] = time.monotonic()
+                try:
+                    await fit_segment_async(
+                        settings, seg, audio_dir, voice, timeout=timeout
+                    )
+                except Exception as e:  # noqa: BLE001
+                    audio_path(audio_dir, seg).unlink(missing_ok=True)
+                    seg.note = _fail_note(e)
+                    seg.audio = ""
+                    seg.tts_key = ""
+                finally:
+                    inflight.pop(seg.idx, None)
             done += 1
             if on_progress:
-                on_progress(done, len(segs), seg)
+                on_progress(done, len(segs), seg, inflight=len(inflight))
 
-        await asyncio.gather(*(one(s) for s in segs))
+        async def heartbeat() -> None:
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=HEARTBEAT_SEC)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                now = time.monotonic()
+                stuck = [
+                    (idx, now - t0)
+                    for idx, t0 in list(inflight.items())
+                    if now - t0 >= HEARTBEAT_SEC
+                ]
+                for idx, elapsed in stuck:
+                    warn(f"TTS 等待 idx={idx:04d} 已 {elapsed:.0f}s")
 
-    asyncio.run(main())
+        hb = asyncio.create_task(heartbeat())
+        try:
+            await asyncio.gather(*(one(s) for s in segs))
+        finally:
+            stop.set()
+            await hb
+
+    _run_async(main())
 
 
 def validate_tts(

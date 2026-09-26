@@ -164,8 +164,10 @@ class Settings:
     translate_refill_max_rounds: int
     tts_concurrency: int
     tts_max_rate: int
+    tts_timeout: float
     cover_image: Path | None
     output_dir: Path | None
+    log_dir: Path
     env_files: list[Path]
 
     @classmethod
@@ -194,6 +196,7 @@ class Settings:
         cover_image = _project_path(cover_raw, root) if cover_raw else None
         output_raw = (os.getenv("OUTPUT_DIR") or "").strip()
         output_dir = _project_path(output_raw, root) if output_raw else None
+        log_dir = _project_path(os.getenv("LOG_DIR") or "logs", root)
 
         return cls(
             root=root,
@@ -229,6 +232,7 @@ class Settings:
             ),
             tts_concurrency=max(1, int(os.getenv("TTS_CONCURRENCY") or "2")),
             tts_max_rate=max(0, int(os.getenv("TTS_MAX_RATE") or "30")),
+            tts_timeout=max(5.0, float(os.getenv("TTS_TIMEOUT") or "45")),
             parakeet_model=(
                 os.getenv("PARAKEET_MODEL") or "mlx-community/parakeet-tdt-0.6b-v3"
             ).strip(),
@@ -245,5 +249,6 @@ class Settings:
             parakeet_beam_size=max(1, int(os.getenv("PARAKEET_BEAM_SIZE") or "5")),
             cover_image=cover_image,
             output_dir=output_dir,
+            log_dir=log_dir,
             env_files=env_files,
         )

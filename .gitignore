@@ -35,6 +35,7 @@ Thumbs.db
 
 # job runtime data (large media + intermediates)
 work/
+logs/
 **/audio/
 *.mp4
 *.wav

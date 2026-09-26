@@ -64,7 +64,7 @@ def build_narration(
                 buf[offset : offset + n] = samples[:n]
                 placed += 1
             if i == 1 or i == len(clips) or i % 100 == 0:
-                progress(i, len(clips), f"place seg_{seg.idx:04d}")
+                progress(i, len(clips), f"seg_{seg.idx:04d}", label="旁白")
 
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(out_wav), "wb") as out:

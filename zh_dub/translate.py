@@ -311,7 +311,12 @@ def translate_segments(
                     title_zh = t
                 n = commit(got)
                 total_got += n
-                progress(ci + 1, len(chunks), f"batch 完成 {n}/{len(chunk)}  {time.time()-t0:.1f}s")
+                progress(
+                    ci + 1,
+                    len(chunks),
+                    f"{n}/{len(chunk)}  {time.time()-t0:.1f}s",
+                    label="翻译",
+                )
         if title_zh:
             need_title = False
         return total_got

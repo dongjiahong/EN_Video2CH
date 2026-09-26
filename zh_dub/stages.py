@@ -12,7 +12,7 @@ from typing import Any
 from .asr import transcribe_to_srt
 from .compose import COVER_SECONDS, mux_video
 from .export import ensure_titles
-from .logutil import highlight, info, progress, warn
+from .logutil import detail, highlight, info, progress, warn
 from .media import (
     clear_proxy_env,
     download_video,
@@ -195,10 +195,11 @@ class TtsStage(Stage):
             f"并发={job.settings.tts_concurrency}  max_rate=+{job.settings.tts_max_rate}%"
         )
 
-        def on_progress(done: int, count: int, seg: Segment) -> None:
-            if seg.note == "cached" and done % 50 and done != count:
-                return
-            progress(done, count, f"idx={seg.idx:04d} {seg.tts_dur:.2f}s {seg.note}")
+        def on_progress(done: int, count: int, seg: Segment, **kw: Any) -> None:
+            inflight = int(kw.get("inflight") or 0)
+            extra = f"进行中 {inflight}" if inflight else ""
+            progress(done, count, extra, label="TTS")
+            detail(f"idx={seg.idx:04d} {seg.tts_dur:.2f}s {seg.note}")
             # persist keys as we go so an interrupted run only redoes the rest
             if done % 20 == 0 or done == count:
                 save_segments(segs, path)

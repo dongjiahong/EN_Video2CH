@@ -50,12 +50,14 @@ from zh_dub.clean import clean_work  # noqa: E402
 from zh_dub.config import Settings, normalize_quality  # noqa: E402
 from zh_dub.export import publish_output  # noqa: E402
 from zh_dub.logutil import (  # noqa: E402
+    attach,
     detail,
     format_status_line,
     highlight,
     info,
     keyval,
     log,
+    set_job,
     stage,
     stage_done,
     warn,
@@ -275,6 +277,7 @@ def _run_one(
     job: Job | None = None
     try:
         work_dir = resolve_work_dir(settings, work, url)
+        set_job(work_dir.name)
         job = _make_job(
             settings,
             work_dir,
@@ -302,6 +305,8 @@ def _run_one(
     except Exception as e:  # noqa: BLE001
         warn(f"FAILED: {e}")
         return 1, work_dir, None, str(e)
+    finally:
+        set_job("")
 
 
 def _limit_from_args(args: argparse.Namespace) -> tuple[int, int]:
@@ -447,16 +452,18 @@ def main(argv: list[str] | None = None) -> int:
         warn("--yes 只在 --clean 时有效")
 
     t0 = time.time()
-    stage("config")
     settings = Settings.load(ROOT)
+    attach(settings.log_dir)
+    stage("config")
     if args.quality:
         settings.quality = normalize_quality(args.quality)
     for f in settings.env_files:
         detail(f"loaded {f}")
-    keyval("python", settings.python)
     keyval("model", settings.model)
     keyval("voice", args.voice or settings.voice)
     keyval("quality", settings.quality)
+    detail(f"python={settings.python}")
+    detail(f"log_dir={settings.log_dir}")
     if args.from_stage or args.to_stage:
         keyval("stages", f"{args.from_stage or STAGES[0]}..{args.to_stage or STAGES[-1]}")
     output_dir = resolve_output_dir(settings, args.output)
@@ -502,10 +509,9 @@ def main(argv: list[str] | None = None) -> int:
         keyval("output", out)
     if work:
         keyval("state", work / "job_state.json")
-        info("常用命令:")
-        detail(f"查看进度:          python job_run.py --work {work} --status")
-        detail(f"改中文后重做配音:  python job_run.py --work {work} --from tts")
-        detail(f"失败后续跑:        python job_run.py --work {work}")
+        info(f"查看进度:          python job_run.py --work {work} --status")
+        info(f"改中文后重做配音:  python job_run.py --work {work} --from tts")
+        info(f"失败后续跑:        python job_run.py --work {work}")
     stage_done("job-done")
     return 0
 

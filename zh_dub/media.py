@@ -49,6 +49,7 @@ def ffprobe_duration(settings: Settings, path: Path) -> float:
         check=True,
         capture_output=True,
         text=True,
+        timeout=15,
     )
     return float(cp.stdout.strip())
 

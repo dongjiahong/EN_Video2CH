@@ -60,9 +60,9 @@ def clean_work(settings: Settings, work: Path, out: Path, *, yes: bool = False) 
 
     if not yes:
         for p in victims[:30]:
-            detail(f"will remove [{'dir' if p.is_dir() else 'file'}] {p.name}")
+            info(f"will remove [{'dir' if p.is_dir() else 'file'}] {p.name}")
         if len(victims) > 30:
-            detail(f"... and {len(victims)-30} more")
+            info(f"... and {len(victims)-30} more")
         warn("dry-run：未删除任何文件")
         info(f"确认 {out.name} 无误后执行:\n  python job_run.py --work {work} --clean --yes")
         stage_done("clean", "dry-run")
